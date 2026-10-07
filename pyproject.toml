@@ -1,0 +1,42 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "clearcanvas"
+version = "0.3.6"
+description = "ClearCanvas local Windows document workbench"
+requires-python = ">=3.11,<3.14"
+dependencies = [
+  "PySide6-Essentials>=6.8,<7",
+  "Pillow>=11.3,<13",
+  "pypdfium2>=5,<6",
+  "opencv-python-headless>=4.10,<5",
+  "pypdf>=6,<7",
+  "scikit-image>=0.25,<0.27",
+]
+
+[project.gui-scripts]
+clearcanvas = "clearcanvas.app:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8,<10",
+  "pytest-qt>=4.4,<5",
+  "pyinstaller>=6,<7",
+  "ruff>=0.11,<1",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/clearcanvas"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+qt_api = "pyside6"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
