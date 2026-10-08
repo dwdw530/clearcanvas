@@ -17,15 +17,18 @@ wheels = [
 
 [[package]]
 name = "clearcanvas"
-version = "0.3.6"
+version = "0.3.9"
 source = { editable = "." }
 dependencies = [
     { name = "opencv-python-headless" },
     { name = "pillow" },
+    { name = "pypatchmatch" },
     { name = "pypdf" },
     { name = "pypdfium2" },
     { name = "pyside6-essentials" },
     { name = "scikit-image" },
+    { name = "scipy", version = "1.17.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "scipy", version = "1.18.1", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
 
 [package.dev-dependencies]
@@ -40,10 +43,12 @@ dev = [
 requires-dist = [
     { name = "opencv-python-headless", specifier = ">=4.10,<5" },
     { name = "pillow", specifier = ">=11.3,<13" },
+    { name = "pypatchmatch", specifier = "==2.1.1" },
     { name = "pypdf", specifier = ">=6,<7" },
     { name = "pypdfium2", specifier = ">=5,<6" },
     { name = "pyside6-essentials", specifier = ">=6.8,<7" },
     { name = "scikit-image", specifier = ">=0.25,<0.27" },
+    { name = "scipy", specifier = ">=1.14,<2" },
 ]
 
 [package.metadata.requires-dev]
@@ -365,6 +370,24 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/c9/3b/fab1a12a21bf9223af012e5dd002b7d4265683d21d9fabbd0ccb347316e4/pyinstaller_hooks_contrib-2026.8.tar.gz", hash = "sha256:4d825786ad7a9b7dbcc52d612748a34562fe273461bcfd88f4d549c594bbf8f9", size = 176955, upload-time = "2026-09-30T07:53:52.56Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/8f/f1/3eee0263b487e571aed9204257b45bc2a0b6fec34d0a1adade4d8d8a968c/pyinstaller_hooks_contrib-2026.8-py3-none-any.whl", hash = "sha256:6d21d65323ea4467753afc21f52d7d0e69416ae8101dd88269bf273ad48db084", size = 462145, upload-time = "2026-09-30T07:53:51.167Z" },
+]
+
+[[package]]
+name = "pypatchmatch"
+version = "2.1.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "pillow" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/98/82/35f1dc4e6bd8f662ba9a5ebf16446a046a66054b57502942fccd15d467a0/pypatchmatch-2.1.1.tar.gz", hash = "sha256:4b3886c5a52bb3a35d1c00dd4ce5b22817d8e7253b586e249c6479c9b0ba5e6c", size = 700277, upload-time = "2026-10-06T18:40:04.702Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/02/01/e87763d74da35aa1c5211557c2b4338e39e17a306940a042f0afcec32db3/pypatchmatch-2.1.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:9c9a586ae6366d981613a57daea96e765638e7058c8bd7e611e66aa286e14659", size = 394087, upload-time = "2026-10-06T18:39:57.494Z" },
+    { url = "https://files.pythonhosted.org/packages/8f/fc/deb01cd9fc5284b045ccf7f1e6011d8c189113653c96caad4e359dea3d6e/pypatchmatch-2.1.1-py3-none-macosx_11_0_x86_64.whl", hash = "sha256:f06d6b85279c99cf4e1376de9adef1f9ab22393aeabd37ebbca155ca6026df62", size = 560304, upload-time = "2026-10-06T18:39:58.842Z" },
+    { url = "https://files.pythonhosted.org/packages/f7/26/94fa24404154387a8fc484bb837f346d7a256e2b5cff1fbf7a30b29271e8/pypatchmatch-2.1.1-py3-none-manylinux_2_27_aarch64.manylinux_2_28_aarch64.whl", hash = "sha256:edfd43921e98a8edb54b8047b9a7e1922244d29246878ccbb63787240cd36d92", size = 472393, upload-time = "2026-10-06T18:40:00.487Z" },
+    { url = "https://files.pythonhosted.org/packages/c4/57/0213266250dd2af525cebb2fc6c79faf36ec0f9489599dce8b06d41d9872/pypatchmatch-2.1.1-py3-none-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl", hash = "sha256:40e6f626142426a7868f7a4e1c8abdca26af9b499e6ee417620370d32bbdbb86", size = 632205, upload-time = "2026-10-06T18:40:01.883Z" },
+    { url = "https://files.pythonhosted.org/packages/dc/83/00b0c6bd35a579b189498731e10ae79e17f4fd303c36243ae206e45edfb1/pypatchmatch-2.1.1-py3-none-win_amd64.whl", hash = "sha256:af9b031abe38a3361b48853ee0d41ae0c889ba469120a6945b975681a1803ad8", size = 614728, upload-time = "2026-10-06T18:40:03.437Z" },
 ]
 
 [[package]]

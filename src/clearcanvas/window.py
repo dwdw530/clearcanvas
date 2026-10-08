@@ -17,12 +17,14 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QProgressBar,
     QPushButton,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
+    QSystemTrayIcon,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -72,6 +74,17 @@ class MainWindow(QMainWindow):
         self.statusBar().addPermanentWidget(self.progress)
         self.statusBar().addPermanentWidget(label("本地", muted=True))
         self.editor = RepairController(self)
+        self._exit_requested = False
+        self._closed = False
+        self._close_prompt_open = False
+        self.tray = QSystemTrayIcon(self.windowIcon(), self)
+        self.tray.setToolTip("净界 ClearCanvas")
+        self.tray_menu = QMenu(self)
+        self.tray_menu.addAction("打开净界", self.restore_window)
+        self.tray_menu.addSeparator()
+        self.tray_menu.addAction("退出程序", self.request_exit)
+        self.tray.setContextMenu(self.tray_menu)
+        self.tray.activated.connect(self._tray_activated)
         self._update_controls()
 
     def _action(self, title: str, icon_name: str, slot, shortcut=None) -> QAction:
@@ -488,11 +501,79 @@ class MainWindow(QMainWindow):
         self.add_files([url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()])
         event.acceptProposedAction()
 
+    def restore_window(self) -> None:
+        self.setWindowState(self.windowState() & ~Qt.WindowState.WindowMinimized)
+        self.show()
+        self.raise_()
+        self.activateWindow()
+
+    def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
+        if reason in (
+            QSystemTrayIcon.ActivationReason.Trigger,
+            QSystemTrayIcon.ActivationReason.DoubleClick,
+        ):
+            self.restore_window()
+
+    def request_exit(self) -> None:
+        self.restore_window()
+        self._exit_requested = True
+        try:
+            self.close()
+        finally:
+            self._exit_requested = False
+
+    def _choose_close_action(self) -> str:
+        box = QMessageBox(self)
+        box.setWindowTitle("关闭净界")
+        box.setIcon(QMessageBox.Icon.Question)
+        box.setText("关闭窗口后，您希望净界如何运行？")
+        available = QSystemTrayIcon.isSystemTrayAvailable()
+        box.setInformativeText(
+            "最小化后会继续处理当前任务，可点击右下角托盘图标恢复窗口。"
+            if available else "系统托盘不可用，将最小化到任务栏，当前任务会继续处理。"
+        )
+        minimize = box.addButton(
+            "最小化到托盘" if available else "最小化到任务栏",
+            QMessageBox.ButtonRole.AcceptRole,
+        )
+        exit_button = box.addButton("退出程序", QMessageBox.ButtonRole.DestructiveRole)
+        cancel = box.addButton("取消", QMessageBox.ButtonRole.RejectRole)
+        box.setDefaultButton(minimize)
+        box.setEscapeButton(cancel)
+        box.exec()
+        if box.clickedButton() is minimize:
+            return "minimize"
+        return "exit" if box.clickedButton() is exit_button else "cancel"
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        if self._closed:
+            event.accept()
+            return
+        event.ignore()
+        if self._close_prompt_open:
+            return
+        self._close_prompt_open = True
+        try:
+            action = "exit" if self._exit_requested else self._choose_close_action()
+        finally:
+            self._close_prompt_open = False
+        if action == "minimize":
+            if QSystemTrayIcon.isSystemTrayAvailable():
+                self.tray.show()
+                self.hide()
+            else:
+                self.showMinimized()
+            return
+        if action != "exit":
+            return
+        if self.editor.busy:
+            QMessageBox.information(self, "任务进行中", "请等待当前任务完成后再退出。")
+            return
         if not self.editor.can_leave():
-            event.ignore()
             return
         self._token = -1
         self.service.close()
         self._passwords.clear()
+        self.tray.hide()
+        self._closed = True
         event.accept()

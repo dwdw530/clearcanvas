@@ -7,9 +7,12 @@ from pathlib import Path
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PIL import Image
+from prepare_gmic import prepare_gmic
 from PySide6.QtCore import QByteArray, QRectF, Qt
 from PySide6.QtGui import QColor, QGuiApplication, QPainter, QPixmap
 from PySide6.QtSvg import QSvgRenderer
+
+from clearcanvas.structure_inpaint import GMIC_VERSION
 
 ROOT = Path(__file__).resolve().parents[1]
 OUTPUT = ROOT / "artifacts" / "build"
@@ -34,7 +37,8 @@ def main() -> None:
     assert pixmap.save(str(png))
     with Image.open(png) as image:
         image.save(OUTPUT / "clearcanvas.ico", sizes=[(16, 16), (32, 32), (48, 48), (256, 256)])
-    components = []
+    prepare_gmic(OUTPUT)
+    components = [f"G'MIC {GMIC_VERSION} (standalone CLI)"]
     for name in (
         "PySide6-Essentials",
         "shiboken6",
@@ -45,6 +49,7 @@ def main() -> None:
         "opencv-python-headless",
         "scikit-image",
         "scipy",
+        "pypatchmatch",
         "networkx",
         "imageio",
         "tifffile",

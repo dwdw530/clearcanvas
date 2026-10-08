@@ -2,6 +2,8 @@
 
 import cv2
 import numpy as np
+from scipy.sparse import coo_matrix
+from scipy.sparse.linalg import cg
 
 from clearcanvas.documents import DocumentError
 
@@ -78,3 +80,57 @@ def restore_photo_texture(rgb, mask, excluded, fallback, cancelled, step_budget)
         selected[:] = False
     pixels[missing] = fallback[missing]
     return pixels, steps
+
+
+def interpolate_wide_photo_strokes(rgb, mask, cancelled=lambda: False):
+    """Solve a bounded harmonic fill, avoiding overshoot and patch seams.
+
+    Every marked pixel is excluded from boundary colors. Unknowns at the canvas
+    edge use only real neighbors, so padding cannot inject black into the fill.
+    """
+    def check(_=None):
+        if cancelled():
+            raise DocumentError("已取消。", "cancelled")
+
+    check()
+    missing = mask != 0
+    if not np.any(missing) or np.all(missing):
+        return rgb.copy()
+    yy, xx = np.where(missing)
+    n = len(yy)
+    ids = np.full(mask.shape, -1, np.int32)
+    ids[yy, xx] = np.arange(n)
+    rows, columns, values = [], [], []
+    rhs = np.zeros((n, 3), np.float64)
+    diagonal = np.zeros(n)
+    height, width = mask.shape
+    for dy, dx in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+        check()
+        valid = (yy + dy >= 0) & (yy + dy < height) & (xx + dx >= 0) & (xx + dx < width)
+        i = np.flatnonzero(valid)
+        y, x = yy[valid] + dy, xx[valid] + dx
+        neighbor = ids[y, x]
+        diagonal[i] += 1
+        unknown = neighbor >= 0
+        rows.append(i[unknown])
+        columns.append(neighbor[unknown])
+        values.append(-np.ones(unknown.sum()))
+        rhs[i[~unknown]] += rgb[y[~unknown], x[~unknown]]
+    rows.append(np.arange(n))
+    columns.append(np.arange(n))
+    values.append(diagonal)
+    matrix = coo_matrix(
+        (np.concatenate(values), (np.concatenate(rows), np.concatenate(columns))), shape=(n, n)
+    ).tocsr()
+    pixels = cv2.inpaint(rgb, mask, 5, cv2.INPAINT_NS)
+    for channel in range(3):
+        check()
+        solved, status = cg(
+            matrix, rhs[:, channel], x0=pixels[yy, xx, channel].astype(np.float64),
+            rtol=1e-5, atol=0.01, maxiter=400, callback=check,
+        )
+        if status == 0 and np.all(np.isfinite(solved)):
+            pixels[yy, xx, channel] = np.clip(np.rint(solved), 0, 255).astype(np.uint8)
+    check()
+    pixels[~missing] = rgb[~missing]
+    return pixels

@@ -34,7 +34,8 @@ from clearcanvas.documents import (
     render_document,
 )
 from clearcanvas.pdf_watermarks import remove_pdf_watermarks
-from clearcanvas.photo_repair import restore_photo_texture
+from clearcanvas.photo_repair import interpolate_wide_photo_strokes, restore_photo_texture
+from clearcanvas.texture_inpaint import restore_wide_texture
 
 
 @dataclass
@@ -139,16 +140,23 @@ def _repair_image(image, mask, cancelled=lambda: False, *, photographic=False):
         local_mask[labels[y1:y2, x1:x2] != label] = 0
         rgb = np.ascontiguousarray(pixels[y1:y2, x1:x2, :3])
         if photographic:
-            repaired = inpaint_biharmonic(
-                rgb, local_mask != 0, split_into_regions=True, channel_axis=-1
-            )
-            repaired = np.clip(np.rint(repaired * 255), 0, 255).astype(np.uint8)
             excluded = mask[y1:y2, x1:x2].copy()
             excluded[pixels[y1:y2, x1:x2, 3] < 250] = 255
-            repaired, steps = restore_photo_texture(
-                rgb, local_mask, excluded, repaired, cancelled, texture_budget
-            )
-            texture_budget -= steps
+            # Keep texture transfer for ordinary narrow lettering. Broad holes
+            # (over 36 pixels across) need a stable tone before any texture claim.
+            wide = cv2.distanceTransform(local_mask, cv2.DIST_L2, 5).max() > 18
+            if wide:
+                repaired = interpolate_wide_photo_strokes(rgb, excluded, cancelled)
+                repaired = restore_wide_texture(rgb, local_mask, excluded, repaired, cancelled)
+            else:
+                repaired = inpaint_biharmonic(
+                    rgb, excluded != 0, split_into_regions=True, channel_axis=-1
+                )
+                repaired = np.clip(np.rint(repaired * 255), 0, 255).astype(np.uint8)
+                repaired, steps = restore_photo_texture(
+                    rgb, local_mask, excluded, repaired, cancelled, texture_budget
+                )
+                texture_budget -= steps
         else:
             repaired = cv2.inpaint(rgb, local_mask, 3, cv2.INPAINT_TELEA)
         selected = local_mask != 0

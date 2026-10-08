@@ -23,14 +23,95 @@ def photo_pair(color=255, opacity=255, corner=False):
     clean = Image.fromarray(np.stack(channels, axis=2).astype(np.uint8)).convert("RGBA")
     layer = Image.new("RGBA", clean.size)
     draw = ImageDraw.Draw(layer)
+    ink = ((color,) * 3 if isinstance(color, int) else color) + (opacity,)
     if corner:
-        draw.text((230, 590), "PHOTOGRAPHY.COM", fill=(color,) * 3 + (opacity,), font_size=28)
+        draw.text((230, 590), "PHOTOGRAPHY.COM", fill=ink, font_size=28)
     else:
         for yy in (-40, 180, 400, 620):
             for xx in (-110, 440):
-                draw.text((xx, yy), "WATERMARK", fill=(color,) * 3 + (opacity,), font_size=46)
+                draw.text((xx, yy), "WATERMARK", fill=ink, font_size=46)
         layer = layer.rotate(20, resample=Image.Resampling.BICUBIC)
     return clean, Image.alpha_composite(clean, layer)
+
+
+@pytest.mark.parametrize("hue", range(0, 180, 15))
+@pytest.mark.parametrize("opacity,corner", [(255, False), (160, True)])
+def test_photo_colored_ink_across_hue_wheel(hue, opacity, corner):
+    color = tuple(int(c) for c in cv2.cvtColor(
+        np.uint8([[[hue, 230, 240]]]), cv2.COLOR_HSV2RGB
+    )[0, 0])
+    clean, marked = photo_pair(color, opacity, corner)
+    with clean, marked:
+        ink = np.max(np.abs(np.array(marked).astype(int) - np.array(clean)), axis=2) > 20
+        mask = detect_photo_watermark_mask(marked)
+        assert np.mean(mask[ink] != 0) > 0.98
+        nearby = cv2.dilate(ink.astype(np.uint8), np.ones((11, 11), np.uint8)) != 0
+        assert np.count_nonzero((mask != 0) & ~nearby) < ink.sum() * 0.05
+
+
+@pytest.mark.parametrize("filename,digest", [
+    ("06-photo-tiled-changed.png",
+     "3006df31ddf393133ee94da2c11acffbd745877c2a13a8e5f744f8d950e5d2ea"),
+    ("10-photo-corner-changed.png",
+     "59c0496202f4799781e2691605a4bec18d3807cd730b20cbdfd68c17f63fc4ff"),
+])
+def test_user_supplied_color_images_are_accepted_unchanged(filename, digest):
+    path = (Path(__file__).resolve().parents[1]
+            / "artifacts/non-ai-followup-2026-10-07" / filename)
+    if not path.exists():
+        pytest.skip("User acceptance images are not redistributed")
+    assert hashlib.sha256(path.read_bytes()).hexdigest() == digest
+    with Image.open(path).convert("RGB") as image:
+        ink = np.all(np.array(image) == (255, 0, 100), axis=2)
+        mask = detect_photo_watermark_mask(image)
+        assert np.count_nonzero(ink) > 9000
+        assert np.all(mask[ink])
+        nearby = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8)) != 0
+        assert np.count_nonzero((mask != 0) & ~nearby) < ink.sum() * 0.01
+
+
+@pytest.mark.parametrize("color", [(240, 20, 80), (20, 200, 60), (20, 30, 240)])
+def test_colored_headings_and_interior_captions_are_preserved(color):
+    clean, marked = photo_pair()
+    with clean, marked:
+        draw = ImageDraw.Draw(clean)
+        draw.text((140, 15), "PHOTOGRAPHY TUTORIAL", fill=color, font_size=28)
+        draw.text((150, 280), "Ordinary photo caption", fill=color, font_size=32)
+        with pytest.raises(DocumentError) as error:
+            detect_photo_watermark_mask(clean)
+        assert error.value.code == "no_watermark"
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+@pytest.mark.parametrize("color", [(240, 20, 80), (20, 200, 60), (20, 30, 240)])
+def test_opaque_strokes_do_not_erase_the_clean_band(color, scale):
+    clean, unused = photo_pair()
+    unused.close()
+    with clean, clean.resize((960 * scale, 640 * scale)) as background:
+        with background.copy() as marked:
+            ImageDraw.Draw(marked).text(
+                (300 * scale, 530 * scale), "WATERMARK", fill=color, font_size=48 * scale
+            )
+            original = np.array(marked).astype(np.int16)
+            truth = np.array(background).astype(np.int16)
+            ink = np.max(np.abs(original - truth), axis=2) > 10
+            mask = detect_photo_watermark_mask(marked)
+            assert np.mean(mask[ink] != 0) > 0.98
+            fringe = cv2.dilate(ink.astype(np.uint8), np.ones((3, 3), np.uint8)) != 0
+            assert np.count_nonzero((mask != 0) & ~fringe) < ink.sum() * 0.02
+
+
+def test_color_refinement_keeps_both_colors_of_bottom_lettering():
+    with Image.new('RGBA', (1200, 800), (95, 110, 130, 255)) as image:
+        draw = ImageDraw.Draw(image)
+        for x, color in [(110, (240, 20, 80)), (640, (20, 210, 80))]:
+            draw.text((x, 690), 'WATERMARK', fill=color, font_size=52)
+        pixels = np.array(image)
+        mask = detect_photo_watermark_mask(image)
+        for color in [(240, 20, 80), (20, 210, 80)]:
+            ink = np.all(pixels[:, :, :3] == color, axis=2)
+            assert ink.sum() > 1000
+            assert np.all(mask[ink])
 
 
 @pytest.mark.parametrize(

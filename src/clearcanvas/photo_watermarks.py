@@ -99,7 +99,7 @@ def _refine_neutral_corner_line(rgb, gray, opaque, contrast, labels, stats, ids,
     return result
 
 
-def _repeat_stencil(candidate, stencil, check):
+def _repeat_stencil(candidate, stencil, check, min_visible=0.35, colored=False):
     ys, xs = np.where(stencil)
     template = stencil[ys.min() : ys.max() + 1, xs.min() : xs.max() + 1].astype(np.float32)
     h, w = template.shape
@@ -127,16 +127,124 @@ def _repeat_stencil(candidate, stencil, check):
         out=np.zeros_like(denominator),
         where=denominator > 1,
     )
-    scores[(expected < template.sum() * 0.35) | (n < template.size * 0.30)] = 0
+    scores[(expected < template.sum() * min_visible) | (n < template.size * min_visible)] = 0
+    if colored:
+        # A cropped text layer can leave only a row of letter tips, including
+        # away from the canvas edge after rotation. Require the observed ink
+        # to fit the verified lettering, but never invent the missing strokes.
+        tolerant = cv2.dilate(template, np.ones((3, 3), np.uint8))
+        supported = cv2.matchTemplate(target, tolerant, cv2.TM_CCORR)
+        precision = supported / np.maximum(observed, 1)
+        partial = (precision >= 0.96) & (observed >= template.sum() * 0.08)
+        scores[partial] = np.maximum(scores[partial], precision[partial])
     output = np.pad(stencil, padding)
     for _ in range(48):
         check()
         _, score, _, (x, y) = cv2.minMaxLoc(scores)
         if score < 0.82:
             break
-        output[y : y + h, x : x + w] |= template.astype(np.uint8)
+        matched = template.astype(np.uint8)
+        if colored:
+            matched = target[y : y + h, x : x + w].astype(np.uint8) & cv2.dilate(
+                matched, np.ones((3, 3), np.uint8)
+            )
+        output[y : y + h, x : x + w] |= matched
         scores[max(0, y - h // 2) : y + h // 2 + 1, max(0, x - w // 2) : x + w // 2 + 1] = 0
     return output[h - 1 : h - 1 + candidate.shape[0], w - 1 : w - 1 + candidate.shape[1]]
+
+
+def _photo_candidates(rgb, gray, opaque, check):
+    """Separate lettering by contrast and hue without assuming an ink color."""
+    short = min(gray.shape)
+    spread = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2)
+    kernel = np.ones((max(9, int(short * 0.025)) | 1,) * 2, np.uint8)
+    for light, blended in ((True, False), (True, True), (False, False), (False, True)):
+        check()
+        contrast = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT if light else cv2.MORPH_BLACKHAT, kernel)
+        if light and blended:
+            candidate = (spread <= 110) & (contrast > 45) & (gray >= 135)
+        elif light:
+            candidate = (spread <= 12) & (gray >= 248)
+        elif blended:
+            candidate = (spread <= 50) & (contrast > 20) & (gray <= 90)
+        else:
+            candidate = (spread <= 25) & (gray <= 55)
+        yield candidate & opaque, light, blended, False, contrast
+
+    # Grayscale contrast can vanish for colored ink on an equally bright photo.
+    # Measure each RGB channel and use overlapping, circular hue intervals.
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    contrast = np.zeros_like(gray)
+    for channel in cv2.split(rgb):
+        check()
+        contrast = np.maximum(contrast, cv2.morphologyEx(channel, cv2.MORPH_TOPHAT, kernel))
+        contrast = np.maximum(contrast, cv2.morphologyEx(channel, cv2.MORPH_BLACKHAT, kernel))
+    colorful = opaque & (spread >= 40) & (hsv[:, :, 1] >= 65) & (contrast > 18)
+    hue = hsv[:, :, 0].astype(np.int16)
+    saturation_contrast = cv2.morphologyEx(hsv[:, :, 1], cv2.MORPH_TOPHAT, kernel)
+    for saturated in (True, False):
+        candidates = []
+        for center in range(0, 180, 15):
+            check()
+            distance = np.abs(hue - center)
+            candidate = colorful & (np.minimum(distance, 180 - distance) <= 10)
+            if saturated:
+                candidate &= saturation_contrast > 12
+            if np.count_nonzero(candidate) >= max(50, gray.size * 0.0001):
+                candidates.append((float(np.mean(saturation_contrast[candidate])), candidate))
+        for _, candidate in sorted(candidates, key=lambda item: item[0], reverse=True):
+            yield candidate, True, False, True, contrast
+
+
+def _tighten_opaque_color_mask(pixels, mask, stencil):
+    """Refine confirmed flat ink at full resolution, preserving nearby detail.
+
+    Only almost constant, saturated stroke interiors qualify. Translucent or
+    varying ink keeps the conservative mask, including its antialiased fringe.
+    """
+    if not np.any(stencil):
+        return mask
+    stencil = cv2.resize(stencil, (mask.shape[1], mask.shape[0]),
+                         interpolation=cv2.INTER_NEAREST)
+    core = cv2.erode(stencil, np.ones((3, 3), np.uint8)) != 0
+    if np.count_nonzero(core) < 64:
+        return mask
+    samples = pixels[:, :, :3][core].astype(np.int16)
+    # A constant ink mode survives antialiasing, unlike the varying colors of a
+    # translucent stroke. Keep every supported mode so mixed-color lettering
+    # cannot lose its minority color when the dominant color is refined.
+    colors, counts = np.unique(samples, axis=0, return_counts=True)
+    palette = colors[counts >= max(8, len(samples) * 0.005)]
+    palette = palette[np.ptp(palette, axis=1) >= 60]
+    if not len(palette) or len(palette) > 16:
+        return mask
+    explained = np.zeros(len(samples), dtype=bool)
+    for color in palette:
+        explained |= np.max(np.abs(samples - color), axis=1) <= 2
+    if np.mean(explained) < 0.80:
+        return mask
+    # A second contrast branch can leave a disconnected-looking outer rim on
+    # the same stroke. Refine the whole connected selection, not just a fixed
+    # halo around one branch's narrower stencil.
+    count, labels = cv2.connectedComponents(mask, connectivity=8)
+    touched = np.unique(labels[(stencil != 0) & (mask != 0)])
+    members = np.zeros(count, dtype=bool)
+    members[touched] = True
+    members[0] = False
+    region = members[labels]
+    yy, xx = np.where(region)
+    values = pixels[yy, xx, :3].astype(np.int16)
+    ink = np.zeros_like(mask)
+    same = np.zeros(len(values), dtype=bool)
+    for color in palette:
+        same |= np.max(np.abs(values - color), axis=1) <= 24
+    ink[yy[same], xx[same]] = 255
+    # One original-resolution pixel retains antialiasing without erasing the
+    # larger clean band introduced by resizing and conservative dilation.
+    ink = cv2.dilate(ink, np.ones((3, 3), np.uint8))
+    tightened = mask.copy()
+    tightened[region & (ink == 0)] = 0
+    return tightened
 
 
 def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> np.ndarray:
@@ -151,23 +259,15 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
     rgb = pixels[:, :, :3]
     gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
     short = min(gray.shape)
-    spread = rgb.max(axis=2).astype(np.int16) - rgb.min(axis=2)
     opaque = pixels[:, :, 3] >= 250
     result = np.zeros(gray.shape, dtype=np.uint8)
     refined_any = False
     light_lines = []
-    for light, blended in ((True, False), (True, True), (False, False), (False, True)):
+    neutral_lines = []
+    colored_lines = []
+    color_stencil = np.zeros_like(result)
+    for candidate, light, blended, colored, contrast in _photo_candidates(rgb, gray, opaque, check):
         check()
-        kernel = np.ones((max(9, int(short * 0.025)) | 1,) * 2, np.uint8)
-        contrast = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT if light else cv2.MORPH_BLACKHAT, kernel)
-        if light and blended:
-            candidate = (spread <= 110) & opaque & (contrast > 45) & (gray >= 135)
-        elif light:
-            candidate = (spread <= 12) & opaque & (gray >= 248)
-        elif blended:
-            candidate = (spread <= 50) & opaque & (contrast > 20) & (gray <= 90)
-        else:
-            candidate = (spread <= 25) & opaque & (gray <= 55)
         candidate = candidate.astype(np.uint8)
         count, labels, stats, _ = cv2.connectedComponentsWithStats(candidate, 8)
         valid = np.zeros(count, dtype=np.uint8)
@@ -250,17 +350,23 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
             continuous = np.max(np.diff(np.sort(along[ids]))) <= height * 3.5
             if not ((near_edge and len(ids) >= 7 and continuous) or len(repeats) >= 1):
                 continue
-            if not light and any(
+            if (not light or colored) and any(
                 max(0, min(_x + _w, lx + lw) - max(_x, lx))
                 * max(0, min(y + _h, ly + lh) - max(y, ly))
                 > min(_w * _h, lw * lh) * 0.5
-                for lx, ly, lw, lh in light_lines
+                for lx, ly, lw, lh in (
+                    neutral_lines + colored_lines if colored else light_lines
+                )
             ):
-                # Dark gaps bounded by pale lettering resemble a second text
-                # line. They are background, not another watermark to erase.
+                # Dark or colored gaps bounded by pale lettering resemble a
+                # second text line. They belong to the photo, not the ink.
                 continue
             if light:
                 light_lines.append((_x, y, _w, _h))
+            if not colored:
+                neutral_lines.append((_x, y, _w, _h))
+            else:
+                colored_lines.append((_x, y, _w, _h))
             across = centers @ np.array([-direction[1], direction[0]])
             baseline = np.median(across[ids])
             line = (
@@ -279,7 +385,7 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
                 if not expanded.size:
                     expanded = ids
                     break
-            if near_edge and light and blended:
+            if near_edge and light and blended and not colored:
                 refined = _refine_neutral_corner_line(
                     rgb, gray, opaque, contrast, labels, stats, expanded, height, angle
                 )
@@ -316,11 +422,19 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
         selected = np.zeros(count, dtype=np.uint8)
         selected[list(accepted)] = 255
         result |= selected[labels]
+        if colored:
+            color_stencil |= selected[labels]
         if light and not blended and accepted and groups:
             ids = max(groups, key=lambda group: len(group[0]))[0]
             if len(ids) >= 7 and all(int(label) in accepted for label in ids):
-                repeated = _repeat_stencil(candidate, np.isin(labels, ids).astype(np.uint8), check)
+                repeated = _repeat_stencil(
+                    candidate, np.isin(labels, ids).astype(np.uint8), check,
+                    min_visible=0.15 if colored else 0.35,
+                    colored=colored,
+                )
                 result |= repeated * 255
+                if colored:
+                    color_stencil |= repeated * 255
     check()
     if not np.any(result):
         raise DocumentError("未可靠识别到照片水印，请框选需要处理的区域。", "no_watermark")
@@ -332,7 +446,28 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
         radius += 1
     result = cv2.dilate(result, np.ones((radius * 2 + 1,) * 2, np.uint8))
     with image.convert("RGBA") as full:
-        result[np.asarray(full)[:, :, 3] < 250] = 0
+        pixels = np.asarray(full)
+        if np.any(color_stencil):
+            # Downsampling can omit thin tips. Complete only locally supported
+            # ink colors at original resolution, not a larger rectangular hole.
+            core = cv2.erode(color_stencil, np.ones((3, 3), np.uint8)) != 0
+            ink = rgb[core if np.any(core) else color_stencil != 0].astype(np.int16)
+            bins = (ink // 16).astype(np.int32)
+            codes = bins[:, 0] * 256 + bins[:, 1] * 16 + bins[:, 2]
+            counts = np.bincount(codes, minlength=4096)
+            support = cv2.dilate(result, np.ones((7, 7), np.uint8)) != 0
+            yy, xx = np.where(support & (result == 0))
+            values = pixels[yy, xx, :3].astype(np.int16)
+            complete = np.zeros_like(result)
+            for code in np.argsort(counts)[-16:]:
+                if counts[code] < max(20, len(ink) * 0.04):
+                    continue
+                color = np.median(ink[codes == code], axis=0)
+                same = np.max(np.abs(values - color), axis=1) <= 12
+                complete[yy[same], xx[same]] = 255
+            result |= cv2.dilate(complete, np.ones((3, 3), np.uint8))
+            result = _tighten_opaque_color_mask(pixels, result, color_stencil)
+        result[pixels[:, :, 3] < 250] = 0
     check()
     if not np.any(result) or np.count_nonzero(result) > min(result.size * 0.15, 2_000_000):
         raise DocumentError("照片水印识别范围不可靠，请框选分次处理。", "no_watermark")

@@ -90,6 +90,18 @@ def _clean_stream(stream, resources, pdf, ancestors, depth, cancelled):
                 removed += 1
                 index = end
                 continue
+            # Some writers put q/Q around the marked-content wrapper instead
+            # of inside it. Remove that entire state-isolated unit, including
+            # the q already appended, only when no unmarked operation intervenes.
+            if (
+                nesting == 0 and output and output[-1][1] == b"q"
+                and end < len(operations) and operations[end][1] == b"Q"
+                and _isolated([output[-1], *operations[index + 1 : end - 1], operations[end]])
+            ):
+                output.pop()
+                removed += 1
+                index = end + 1
+                continue
         output.append((operands, operator))
         if operator in (b"BT", b"ET"):
             in_text = operator == b"BT"

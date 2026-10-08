@@ -73,15 +73,16 @@ def encrypted_pdf(tmp_path):
 
 
 @pytest.fixture
-def window(qtbot, qapp):
+def window(qtbot, qapp, monkeypatch):
     from PySide6.QtCore import Qt
 
     from clearcanvas.window import MainWindow
 
     apply_theme(qapp)
     widget = MainWindow()
+    monkeypatch.setattr(widget, "_choose_close_action", lambda: "exit")
     widget.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
     qtbot.addWidget(widget)
     widget.show()
     yield widget
-    widget.close()
+    widget.request_exit()

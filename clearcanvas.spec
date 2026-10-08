@@ -2,20 +2,22 @@
 from pathlib import Path
 import importlib.util
 import sys
+from PyInstaller.utils.hooks import collect_dynamic_libs
 
 root = Path(SPECPATH)
 assets = root / "artifacts" / "build"
-if not (assets / "clearcanvas.ico").is_file():
+if not (assets / "clearcanvas.ico").is_file() or not (assets / "gmic" / "gmic.exe").is_file():
     raise SystemExit("Run: uv run python tools/prepare_build.py")
 
 a = Analysis(
     [str(root / "packaging" / "entrypoint.py")],
     pathex=[str(root / "src")],
-    binaries=[],
+    binaries=collect_dynamic_libs("patchmatch"),
     datas=[
         (str(root / "src" / "clearcanvas" / "assets"), "clearcanvas/assets"),
         (str(assets / "licenses"), "licenses"),
         (str(assets / "COMPONENTS.txt"), "."),
+        (str(assets / "gmic"), "gmic"),
         (str(root / "README.md"), "."),
         (str(root / "docs" / "product-design.md"), "docs"),
     ],
@@ -30,7 +32,7 @@ a = Analysis(
 # Only collect project/runtime libraries, never DLLs from unrelated PATH entries.
 # Qt uses Windows' ICU; Poppler's versioned ICU has an incompatible export table.
 qt_directory = Path(importlib.util.find_spec("PySide6").origin).parent
-trusted_roots = [root / ".venv", Path(sys.base_prefix)]
+trusted_roots = [root / ".venv", Path(sys.base_prefix), assets / "gmic"]
 runtime_names = {
     "vcruntime140.dll", "vcruntime140_1.dll",
     "msvcp140.dll", "msvcp140_1.dll", "msvcp140_2.dll",

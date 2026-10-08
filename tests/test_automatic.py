@@ -36,7 +36,7 @@ def pale_image(tmp_path):
     return path
 
 
-def marked_pdf(path, form=False, named=False):
+def marked_pdf(path, form=False, named=False, outer=False):
     writer = PdfWriter()
     font = writer._add_object(
         DictionaryObject(
@@ -61,6 +61,9 @@ def marked_pdf(path, form=False, named=False):
         b".866 .5 -.5 .866 150 250 Tm (WATERMARK) Tj ET Q EMC "
         b"q 0 g BT /F1 12 Tf 40 650 Td (AFTER MARK) Tj ET Q"
     )
+    if outer:
+        contents = contents.replace(b"/Artifact ", b"q /Artifact ")
+        contents = contents.replace(b"BDC q ", b"BDC ").replace(b"Q EMC", b"EMC Q")
     stream = DecodedStreamObject()
     stream.set_data(contents)
     if form:
@@ -144,8 +147,11 @@ def test_no_watermark_and_gray_caption_rejected(tmp_path, color):
 
 
 @pytest.mark.parametrize("form,named", [(False, False), (False, True), (True, False)])
-def test_structured_pdf_preserves_body_shared_resources_and_other_pages(tmp_path, form, named):
-    path = marked_pdf(tmp_path / "marked.pdf", form, named)
+@pytest.mark.parametrize("outer", [False, True])
+def test_structured_pdf_preserves_body_shared_resources_and_other_pages(
+    tmp_path, form, named, outer,
+):
+    path = marked_pdf(tmp_path / "marked.pdf", form, named, outer)
     original_bytes = path.read_bytes()
     before = render_document(path, 1)
     result = auto_repair_document(render_document(path), source_stamp(path))
