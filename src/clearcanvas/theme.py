@@ -31,7 +31,7 @@ def apply_theme(app: QApplication) -> None:
         QToolButton { border: 1px solid transparent; border-radius: 5px; padding: 7px; }
         QToolButton:hover { background: #edf3f0; }
         QToolButton:pressed, QToolButton:checked { background: #dceee8; }
-        QToolButton:focus, QPushButton:focus, QSpinBox:focus, QComboBox:focus {
+        QToolButton:focus, QPushButton:focus, QSpinBox:focus, QComboBox:focus, QLineEdit:focus {
             border: 1px solid #16745c;
         }
         QPushButton { padding: 8px 16px; border: 1px solid #cbd5d0;
@@ -53,8 +53,9 @@ def apply_theme(app: QApplication) -> None:
         QFrame#pageBar { border-top: 1px solid #dbe1de; }
         QLabel#muted { color: #61716a; }
         QLabel#badge { color: #176a54; background: #e6f1eb; padding: 4px 9px; border-radius: 4px; }
-        QComboBox, QSpinBox { border: 1px solid #cbd5d0; background: white;
+        QComboBox, QSpinBox, QLineEdit { border: 1px solid #cbd5d0; background: white;
                              border-radius: 4px; padding: 5px; min-height: 20px; }
+        QLabel#aiError { color: #963a27; }
         QStatusBar { background: #ffffff; border-top: 1px solid #dbe1de; padding: 3px 12px; }
         QStatusBar::item { border: 0; }
         QProgressBar { border: 0; background: #e6ece8; border-radius: 2px; max-height: 4px; }

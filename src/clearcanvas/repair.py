@@ -49,6 +49,8 @@ class RepairResult:
     structured: bool = False
     message: str = "修复完成"
     skipped_pages: list[int] = field(default_factory=list)
+    backend: str = "local"
+    ai_metadata: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -276,6 +278,11 @@ def export_result(
 ) -> Path:
     if cancelled():
         raise DocumentError("已取消。", "cancelled")
+    if result.backend != "local":
+        if result.original.info.kind == "PDF":
+            raise DocumentError("首版云端 AI 暂不支持 PDF 导出。")
+        if source_stamp(result.original.info.path) != result.source_stamp:
+            raise DocumentError("原图片已变化，已取消 AI 结果导出。")
     destination = destination.resolve()
     original = result.original.info.path
     if destination == original or (
@@ -301,6 +308,8 @@ def export_result(
                 rgb.save(temporary, format="JPEG", quality=95, subsampling=0)
         if cancelled():
             raise DocumentError("已取消。", "cancelled")
+        if result.backend != "local" and source_stamp(original) != result.source_stamp:
+            raise DocumentError("导出期间原图片已变化，已放弃本次导出。")
         if overwrite:
             os.replace(temporary, destination)
         elif os.name == "nt":
@@ -313,6 +322,8 @@ def export_result(
 
 
 def _export_pdf(result, destination, pages, cancelled, progress) -> None:
+    if result.backend != "local":
+        raise DocumentError("首版云端 AI 暂不支持 PDF。")
     original = result.original
     if source_stamp(original.info.path) != result.source_stamp:
         raise DocumentError("原 PDF 已变化，已取消导出。")
@@ -432,6 +443,8 @@ def _replace_page_image(writer, index, result):
 
 
 def batch_export(reference, paths, directory, page_text, cancelled, progress):
+    if reference.backend != "local":
+        raise DocumentError("首版云端 AI 暂不支持批量。")
     outputs, errors, notes = [], [], []
     for index, path in enumerate(paths):
         if cancelled():

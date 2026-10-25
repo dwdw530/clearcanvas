@@ -72,7 +72,8 @@ class MainWindow(QMainWindow):
         self.progress.setTextVisible(False)
         self.progress.hide()
         self.statusBar().addPermanentWidget(self.progress)
-        self.statusBar().addPermanentWidget(label("本地", muted=True))
+        self.mode_status = label("本地", muted=True)
+        self.statusBar().addPermanentWidget(self.mode_status)
         self.editor = RepairController(self)
         self._exit_requested = False
         self._closed = False
@@ -300,6 +301,8 @@ class MainWindow(QMainWindow):
         view_menu.addActions(
             [self.file_dock.toggleViewAction(), self.details_dock.toggleViewAction()]
         )
+        settings_menu = self.menuBar().addMenu("设置")
+        self.ai_settings_action = settings_menu.addAction("AI 接口设置…")
         help_menu = self.menuBar().addMenu("帮助")
         about = help_menu.addAction(icon("info"), "关于净界")
         about.triggered.connect(
@@ -316,6 +319,8 @@ class MainWindow(QMainWindow):
         self.add_files(paths)
 
     def add_files(self, paths: list[str | Path]) -> None:
+        if self.editor.busy:
+            return
         first_key = None
         errors = []
         with QSignalBlocker(self.files):
@@ -398,6 +403,8 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _loaded(self, token: int, preview: Preview) -> None:
+        if self.editor.ai.loaded(token, preview):
+            return
         if token != self._token or self._active_key is None:
             return
         if isinstance(preview, (RepairResult, BatchResult, Path)):
@@ -422,6 +429,8 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _failed(self, token: int, error: DocumentError) -> None:
+        if self.editor.ai.failed(token, error):
+            return
         if token != self._token or self._active_key is None:
             return
         if self.editor.busy:
@@ -567,11 +576,16 @@ class MainWindow(QMainWindow):
         if action != "exit":
             return
         if self.editor.busy:
-            QMessageBox.information(self, "任务进行中", "请等待当前任务完成后再退出。")
+            QMessageBox.information(self, "任务进行中", "请先取消或等待当前任务完成后再退出。")
             return
         if not self.editor.can_leave():
             return
         self._token = -1
+        try:
+            self.editor.ai.close()
+        except DocumentError as error:
+            QMessageBox.warning(self, "暂不能退出", str(error))
+            return
         self.service.close()
         self._passwords.clear()
         self.tray.hide()

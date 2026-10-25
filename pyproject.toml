@@ -4,8 +4,8 @@ build-backend = "hatchling.build"
 
 [project]
 name = "clearcanvas"
-version = "0.3.9"
-description = "ClearCanvas local Windows document workbench"
+version = "0.4.0"
+description = "ClearCanvas Windows workbench with local and optional cloud image repair"
 requires-python = ">=3.11,<3.14"
 dependencies = [
   "PySide6-Essentials>=6.8,<7",

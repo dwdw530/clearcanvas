@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from clearcanvas.ai_controller import AiController
 from clearcanvas.icons import icon
 from clearcanvas.repair import (
     BatchResult,
@@ -82,7 +83,7 @@ class RepairController(QObject):
         self.batch_button.clicked.connect(self.batch)
         bar.addWidget(self.batch_button)
         self.cancel_button = QPushButton(icon("x"), "取消")
-        self.cancel_button.clicked.connect(self.cancelled.set)
+        self.cancel_button.clicked.connect(self.cancel)
         self.cancel_action = bar.addWidget(self.cancel_button)
         self.range_panel = QWidget()
         range_layout = QVBoxLayout(self.range_panel)
@@ -100,7 +101,12 @@ class RepairController(QObject):
         window.details.layout().insertWidget(0, self.range_panel)
         window.service.progress.connect(self._progress)
         window.canvas.selection_changed.connect(self.selection_changed)
+        self.ai = AiController(self)
         self.refresh()
+
+    def cancel(self):
+        self.cancelled.set()
+        self.ai.cancel()
 
     def _progress(self, done, total):
         if self.busy:
@@ -149,6 +155,7 @@ class RepairController(QObject):
 
     def note_preview(self):
         self.stamp = source_stamp(self.window._preview.info.path)
+        self.ai.note_preview()
         self.refresh()
 
     def can_leave(self):
@@ -170,6 +177,9 @@ class RepairController(QObject):
         preview = self.window._preview
         if self.busy or preview is None:
             return
+        if self.ai.cloud:
+            self.ai.start(True)
+            return
         self.begin("正在自动识别水印")
         self.window._token = self.window.service.submit(
             auto_repair_document, preview, self.stamp, self.cancelled.is_set
@@ -179,6 +189,9 @@ class RepairController(QObject):
     def start(self):
         preview = self.window._preview
         if self.busy or preview is None or not self.window.canvas.regions:
+            return
+        if self.ai.cloud:
+            self.ai.start(False)
             return
         if (
             preview.info.kind == "PDF"
@@ -258,7 +271,10 @@ class RepairController(QObject):
             preview = self.result.preview if index == 1 else self.result.original
             self.window.canvas.display(preview, False, True)
             self.window.canvas.show_regions(index == 0)
-            self.window.badge.setText("结果" if index == 1 else "原件")
+            self.window.badge.setText(
+                ("云端 AI 结果" if self.result.backend == "cloud_ai" else "结果")
+                if index == 1 else "原件"
+            )
 
     def export(self):
         if self.result is None or self.busy:
@@ -329,6 +345,9 @@ class RepairController(QObject):
     def batch(self):
         if self.result is None or self.busy:
             return
+        if self.result.backend != "local":
+            QMessageBox.information(self.window, "暂不支持", "首版云端 AI 暂不支持批量。")
+            return
         directory = QFileDialog.getExistingDirectory(self.window, "选择批量输出目录")
         if not directory:
             return
@@ -386,6 +405,8 @@ class RepairController(QObject):
         self.window.canvas.setEnabled(not self.busy)
         self.window.files.setEnabled(not self.busy)
         self.window.open_action.setEnabled(not self.busy)
+        if hasattr(self, "ai"):
+            self.ai.refresh()
         if self.busy:
             for action in (
                 self.window.remove_action,

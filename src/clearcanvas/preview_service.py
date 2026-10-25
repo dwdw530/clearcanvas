@@ -51,6 +51,8 @@ class PreviewService(QObject):
         return token
 
     def _complete(self, token: int, future: Future[Preview]) -> None:
+        if self._future is future:
+            self._future = None  # Do not retain uploaded image buffers in completed futures.
         if self._closed or token != self._token:
             return
         try:

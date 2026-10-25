@@ -50,6 +50,36 @@ def make_pdf(path: Path, password: str | None = None) -> Path:
     return path
 
 
+@pytest.fixture(autouse=True)
+def isolate_ai_settings_and_network(tmp_path, monkeypatch):
+    """No test may read real credentials, write user settings or contact a relay."""
+    from PySide6.QtCore import QSettings
+    from PySide6.QtNetwork import QNetworkAccessManager
+
+    from clearcanvas import ai_controller
+    from clearcanvas.ai_settings import AiSettings
+
+    class Credentials:
+        def read(self, root):
+            return ""
+
+        def write(self, root, key):
+            raise AssertionError("Real credential persistence is forbidden in tests")
+
+        def delete(self, root):
+            pass
+
+    def make_settings():
+        settings = QSettings(str(tmp_path / "isolated-ai.ini"), QSettings.Format.IniFormat)
+        return AiSettings(settings, Credentials())
+
+    def deny_network(*args, **kwargs):
+        raise AssertionError("Network forbidden: inject an offline transport")
+
+    monkeypatch.setattr(ai_controller, "AiSettings", make_settings)
+    monkeypatch.setattr(QNetworkAccessManager, "post", deny_network)
+
+
 @pytest.fixture
 def sample_image(tmp_path):
     path = tmp_path / "测试 图片.png"

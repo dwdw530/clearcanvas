@@ -2,10 +2,17 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from clearcanvas import structure_inpaint as structure
 from clearcanvas.documents import DocumentError
 from clearcanvas.photo_repair import interpolate_wide_photo_strokes
 from clearcanvas.repair import _repair_image
 from clearcanvas.texture_inpaint import restore_wide_texture
+
+
+@pytest.fixture
+def runtime():
+    if not structure.executable_path().is_file():
+        pytest.skip("Run tools/prepare_gmic.py to test the pinned native runtime")
 
 
 def broad_texture():
@@ -19,7 +26,7 @@ def broad_texture():
     return rgb, marked, mask
 
 
-def test_upstream_texture_fill_improves_broad_reference_and_preserves_surroundings():
+def test_upstream_texture_fill_improves_broad_reference_and_preserves_surroundings(runtime):
     truth, marked, mask = broad_texture()
     baseline = interpolate_wide_photo_strokes(marked, mask)
     snapshot = mask.copy()
