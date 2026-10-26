@@ -2,9 +2,19 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 from PIL import Image
-from PySide6.QtCore import QObject
-from PySide6.QtWidgets import QComboBox, QLabel, QMessageBox, QPushButton, QVBoxLayout, QWidget
+from PySide6.QtCore import QIODevice, QObject, QSaveFile
+from PySide6.QtWidgets import (
+    QComboBox,
+    QFileDialog,
+    QLabel,
+    QMessageBox,
+    QPushButton,
+    QVBoxLayout,
+    QWidget,
+)
 
 from clearcanvas.ai_repair import (
     AiPlan,
@@ -12,6 +22,7 @@ from clearcanvas.ai_repair import (
     compose_result,
     decode_response,
     encode_plan,
+    png_bytes,
     prepare_plan,
     test_plan,
     validate_response,
@@ -210,13 +221,84 @@ class AiController(QObject):
             )
 
     def confirm_alignment(self):
+        state = self.validated.alignment
+        images = [(self.plan.canvas, "上传图"), (self.validated.returned_image, "完整 AI 返回图")]
+        if state == "corrected":
+            title = "已本地校正，需核对对齐"
+            text = (
+                f"检测到最多 {self.validated.displacement:.1f} 个上传像素的整体偏移，"
+                "已在本地校正并重新检查对齐，没有再次调用 API。"
+                "请比较上传图与校正图的五官、边缘及修复区；无法确定请选择取消。"
+            )
+            images.append((self.validated.image, "本地校正图（待确认）"))
+        elif state == "rejected":
+            title = "返回图已保留，本次不能合成"
+            text = (
+                "返回图存在明显位移、缩放、构图变化，或校正会缺失修复区内容，已禁止合成。"
+                "API 已返回图片，本地拒绝不能撤销服务端费用。"
+                "可先另存完整返回图留存，不会再次调用 API；它不是原尺寸蒙版合成结果。"
+                "关闭后不再保留本次返回图，原件与上次结果不变。"
+            )
+        else:
+            title = "需核对对齐"
+            text = (
+                "无法可靠自动判断构图对应。请比较上传图与完整返回图的五官、边缘与构图。"
+                "确认前不生成可导出结果；无法确定请选择取消。"
+            )
+        if state != "rejected":
+            text += "确认前不能合成；取消前可另存完整返回图留存，另存不会联网或计费。"
         return review_dialog(
             self.window,
-            "需核对对齐",
-            "无法可靠自动判断构图对应。请比较上传图与完整返回图的五官、边缘与构图。"
-            "确认前不生成可导出结果；无法确定请选择取消。",
-            [(self.plan.canvas, "上传图"), (self.validated.image, "完整 AI 返回图")],
+            title,
+            text,
+            images,
+            allow_accept=state != "rejected",
+            save_callback=self.save_returned,
         )
+
+    def save_returned(self):
+        """Explicit local PNG retention, separate from a validated mask-only result."""
+        output = None
+        try:
+            if not self._current() or self.validated is None:
+                raise DocumentError("任务已取消或过期，不能另存本次返回图。")
+            original = self.plan.original.info.path.resolve()
+            name, _ = QFileDialog.getSaveFileName(
+                self.window,
+                "另存完整 AI 返回图（未经合成）",
+                str(original.with_name(original.stem + "-ai-returned.png")),
+                "PNG (*.png)",
+            )
+            if not name:
+                return False
+            destination = Path(name).resolve()
+            if destination == original or (destination.exists() and destination.samefile(original)):
+                raise DocumentError("不能覆盖原文件，请使用另一个文件名。")
+            if destination.suffix.lower() != ".png":
+                raise DocumentError("完整 AI 返回图仅支持另存 PNG。")
+            data = png_bytes(self.validated.returned_image)
+            output = QSaveFile(str(destination))
+            output.setDirectWriteFallback(False)
+            if not output.open(QIODevice.OpenModeFlag.WriteOnly) or output.write(data) != len(data):
+                raise DocumentError("返回图保存失败，请检查目标目录的权限和可用空间。")
+            if not self._current():
+                raise DocumentError("任务已取消或过期，未保存返回图。")
+            if not output.commit():
+                raise DocumentError("返回图保存失败；没有用不完整文件替换目标。")
+        except (DocumentError, OSError, ValueError) as error:
+            if output is not None:
+                output.cancelWriting()
+            text = (
+                str(error) if isinstance(error, DocumentError) else "返回图保存失败，请换一个路径。"
+            )
+            QMessageBox.warning(self.window, "未保存返回图", text)
+            return False
+        QMessageBox.information(
+            self.window,
+            "已另存完整 AI 返回图",
+            "已保存完整返回画布，未经蒙版合成或画质验收；原件和上次结果未变，没有新增 API 调用。",
+        )
+        return True
 
     def loaded(self, token, value):
         if token != self.local_token:
@@ -252,11 +334,21 @@ class AiController(QObject):
             elif self.step == "validate":
                 self.validated = value
                 confirmed = False
-                if value.alignment == "uncertain":
+                if value.alignment != "aligned":
                     confirmed = self.confirm_alignment()
+                    if value.alignment == "rejected":
+                        self._end(
+                            DocumentError(
+                                "返回图已供核对或另存，本次未合成；不会自动重试。", "alignment"
+                            )
+                        )
+                        return True
                     if not confirmed:
                         self._end(DocumentError("未确认对齐，已放弃本次返回图。", "cancelled"))
                         return True
+                if not self._current():
+                    self._end(DocumentError("已取消或任务已过期。", "cancelled"))
+                    return True
                 self.window.status.setText("本地合成")
                 self._submit(
                     "compose",
@@ -316,16 +408,16 @@ class AiController(QObject):
 
     @staticmethod
     def _dispose(value):
-        if isinstance(value, AiPlan):
+        if isinstance(value, (AiPlan, AiValidated)):
             value.close()
-        elif isinstance(value, (AiValidated, RepairResult)):
+        elif isinstance(value, RepairResult):
             value.image.close()
 
     def _release(self):
         if self.plan:
             self.plan.close()
         if self.validated:
-            self.validated.image.close()
+            self.validated.close()
         self.plan = self.validated = None
         self.key = ""
         self.config = None

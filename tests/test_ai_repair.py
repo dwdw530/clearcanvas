@@ -29,6 +29,25 @@ def plan(sample_image):
     value.close()
 
 
+@pytest.fixture
+def textured_plan(tmp_path):
+    rng = np.random.default_rng(123)
+    pixels = np.full((1024, 1536, 4), 255, np.uint8)
+    pixels[:, :, :3] = rng.integers(0, 256, (1024, 1536, 3), np.uint8)
+    pixels[440:470, 700:740, 3] = 120
+    path = tmp_path / "textured.png"
+    with Image.fromarray(pixels) as image:
+        image.save(path)
+    mask = np.zeros((1024, 1536), np.uint8)
+    mask[40:60, 40:60] = 255
+    mask[980:1000, 1480:1500] = 255
+    mask[440:470, 700:740] = 255
+    with Image.fromarray(pixels) as image:
+        value = ai.plan_image(image, mask, preview=render_document(path), stamp=source_stamp(path))
+    yield value
+    value.close()
+
+
 def test_crop_padding_mask_and_metadata(plan):
     assert plan.canvas.size == ai.CANVAS == plan.remote_mask.size
     x1, y1, x2, y2 = plan.content
@@ -187,8 +206,13 @@ def test_geometry_shift_rejected_and_flat_content_requires_review(tmp_path):
     shifted = cv2.warpAffine(np.array(plan.canvas), np.float32([[1, 0, 22], [0, 1, 15]]), ai.CANVAS)
     with Image.fromarray(shifted) as image:
         assert ai.alignment_status(plan, image) == "rejected"
-        with pytest.raises(DocumentError, match="位移"):
-            ai.validate_response(plan, response(image))
+        checked = ai.validate_response(plan, response(image))
+        assert checked.alignment == "rejected"
+        assert checked.returned_image.tobytes() == image.tobytes()
+        for confirmed in (False, True):
+            with pytest.raises(DocumentError, match="核对对齐"):
+                ai.compose_result(plan, checked, AiConfig(), confirmed)
+        checked.close()
     with Image.new("RGB", ai.CANVAS, "white") as image:
         assert ai.alignment_status(plan, image) == "uncertain"
     plan.close()
@@ -196,6 +220,119 @@ def test_geometry_shift_rejected_and_flat_content_requires_review(tmp_path):
         flat_plan = ai.plan_image(image, mask)
         assert ai.alignment_status(flat_plan, flat_plan.canvas) == "uncertain"
         flat_plan.close()
+
+
+@pytest.mark.parametrize("shift", [(5, -3), (-6, 4), (8, 0)])
+def test_small_shift_corrected_only_after_review_with_rgba_protection(textured_plan, shift):
+    plan = textured_plan
+    edited = np.array(plan.canvas)
+    edited[np.array(plan.remote_mask)[:, :, 3] == 0] = (7, 111, 229)
+    matrix = np.float32([[1, 0, shift[0]], [0, 1, shift[1]]])
+    with Image.fromarray(cv2.warpAffine(edited, matrix, ai.CANVAS)) as returned:
+        assert ai.alignment_status(plan, returned) == "correctable"
+        checked = ai.validate_response(plan, response(returned))
+        assert checked.alignment == "corrected"
+        assert 3 < checked.displacement <= ai.MAX_CORRECTION_PIXELS
+        assert checked.raw_image is not None
+        assert checked.returned_image.tobytes() == returned.tobytes()
+        assert ai.alignment_status(plan, checked.image) == "aligned"
+        with pytest.raises(DocumentError, match="核对对齐"):
+            ai.compose_result(plan, checked, AiConfig())
+        result = ai.compose_result(plan, checked, AiConfig(), confirmed=True)
+    output = np.array(result.image)
+    assert np.array_equal(output[plan.mask == 0], plan.pixels[plan.mask == 0])
+    assert np.array_equal(output[:, :, 3], plan.pixels[:, :, 3])
+    assert np.array_equal(output[450, 710, :3], (7, 111, 229))
+    assert result.ai_metadata["alignment"] == "corrected"
+    assert result.ai_metadata["correction_pixels"] == checked.displacement
+    result.image.close()
+    checked.close()
+    for image in (checked.image, checked.raw_image):
+        with pytest.raises(ValueError):
+            image.tobytes()
+
+
+@pytest.mark.parametrize(
+    "matrix",
+    [
+        np.float32([[1, 0, 10], [0, 1, 9]]),
+        cv2.getRotationMatrix2D((768, 512), 0, 1.007),
+        cv2.getRotationMatrix2D((768, 512), 1, 1),
+    ],
+    ids=["large-translation", "scale", "rotation"],
+)
+def test_excessive_geometry_kept_for_review_not_composition(textured_plan, matrix):
+    shifted = cv2.warpAffine(np.array(textured_plan.canvas), matrix, ai.CANVAS)
+    with Image.fromarray(shifted) as image:
+        checked = ai.validate_response(textured_plan, response(image))
+        assert checked.alignment == "rejected"
+        assert checked.returned_image.tobytes() == image.tobytes()
+        with pytest.raises(DocumentError, match="核对对齐"):
+            ai.compose_result(textured_plan, checked, AiConfig(), confirmed=True)
+        checked.close()
+
+
+def test_correction_never_fills_missing_mask_edge(textured_plan):
+    plan = textured_plan
+    plan.mask[500:520, -2:] = 255
+    matrix = np.float32([[1, 0, 6], [0, 1, 0]])
+    with Image.fromarray(cv2.warpAffine(np.array(plan.canvas), matrix, ai.CANVAS)) as image:
+        assert ai.alignment_status(plan, image) == "correctable"
+        checked = ai.validate_response(plan, response(image))
+        assert checked.alignment == "rejected"
+        assert checked.raw_image is None
+        assert checked.returned_image.tobytes() == image.tobytes()
+        checked.close()
+
+
+def test_failed_correction_recheck_preserves_raw_and_blocks_override(textured_plan, monkeypatch):
+    matrix = np.float32([[1, 0, 5], [0, 1, 0]])
+    monkeypatch.setattr(ai, "alignment_status", lambda *args: "uncertain")
+    shifted = cv2.warpAffine(np.array(textured_plan.canvas), matrix, ai.CANVAS)
+    with Image.fromarray(shifted) as image:
+        checked = ai.validate_response(textured_plan, response(image))
+        assert checked.alignment == "rejected"
+        assert checked.returned_image.tobytes() == image.tobytes()
+        with pytest.raises(DocumentError, match="核对对齐"):
+            ai.compose_result(textured_plan, checked, AiConfig(), confirmed=True)
+        checked.close()
+
+
+def test_local_geometry_error_keeps_safe_response_for_manual_review(plan, monkeypatch):
+    def fail(*args):
+        raise cv2.error("offline fake geometry error")
+
+    monkeypatch.setattr(ai, "_alignment_check", fail)
+    checked = ai.validate_response(plan, response(plan.canvas))
+    assert checked.alignment == "uncertain"
+    assert checked.image.tobytes() == plan.canvas.tobytes()
+    with pytest.raises(DocumentError, match="核对对齐"):
+        ai.compose_result(plan, checked, AiConfig())
+    checked.close()
+
+
+def test_padding_never_counts_as_available_repair_content():
+    rng = np.random.default_rng(321)
+    pixels = rng.integers(0, 256, (300, 1536, 3), np.uint8)
+    mask = np.zeros((300, 1536), np.uint8)
+    mask[20:35, 40:60] = 255
+    mask[285:299, 1480:1500] = 255
+    with Image.fromarray(pixels) as image:
+        plan = ai.plan_image(image, mask)
+    x1, y1, x2, y2 = plan.content
+    assert y1 > 0 and y2 < ai.CANVAS[1]
+    matrix = np.float32([[1, 0, 0], [0, 1, 6]])
+    returned = np.array(plan.canvas)
+    returned[y1:y2, x1:x2] = cv2.warpAffine(
+        returned[y1:y2, x1:x2], matrix, (x2 - x1, y2 - y1), borderValue=(240, 240, 240)
+    )
+    with Image.fromarray(returned) as image:
+        assert ai.alignment_status(plan, image) == "correctable"
+        checked = ai.validate_response(plan, response(image))
+        assert checked.alignment == "rejected"
+        assert checked.image.tobytes() == image.tobytes()
+        checked.close()
+    plan.close()
 
 
 def test_uncertain_not_exportable_and_ai_lower_layer_guards(plan, tmp_path):

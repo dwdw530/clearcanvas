@@ -48,6 +48,40 @@ def confirm(parent, title, text):
     return box.exec() == QMessageBox.StandardButton.Yes
 
 
+class _ReviewImage(QScrollArea):
+    def __init__(self, pixmap, title):
+        super().__init__()
+        self.pixmap = pixmap
+        self.full = False
+        self.image = QLabel()
+        self.image.setAccessibleName(title)
+        self.setWidget(self.image)
+        self.setMinimumSize(180, 170)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._update_pixmap()
+
+    def set_full(self, full):
+        self.full = full
+        self._update_pixmap()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._update_pixmap()
+
+    def _update_pixmap(self):
+        pixmap = self.pixmap
+        if not self.full:
+            size = self.viewport().size()
+            pixmap = pixmap.scaled(
+                max(1, min(size.width(), pixmap.width())),
+                max(1, min(size.height(), pixmap.height())),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        self.image.setPixmap(pixmap)
+        self.image.adjustSize()
+
+
 def image_label(image, title):
     panel = QWidget()
     layout = QVBoxLayout(panel)
@@ -55,30 +89,16 @@ def image_label(image, title):
     rgba = image.convert("RGBA")
     qimage = QImage(rgba.tobytes(), rgba.width, rgba.height, QImage.Format.Format_RGBA8888).copy()
     rgba.close()
-    label = QLabel()
-    label.setAccessibleName(title)
-    pixmap = QPixmap.fromImage(qimage)
-    thumbnail = pixmap.scaled(
-        340, 230, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation
-    )
-    label.setPixmap(thumbnail)
-    scroll = QScrollArea()
-    scroll.setWidget(label)
-    scroll.setMinimumSize(180, 170)
-    scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    scroll = _ReviewImage(QPixmap.fromImage(qimage), title)
     layout.addWidget(scroll, 1)
     zoom = QCheckBox("原始比例（可滚动检查）")
-
-    def set_zoom(full):
-        label.setPixmap(pixmap if full else thumbnail)
-        label.adjustSize()
-
-    zoom.toggled.connect(set_zoom)
+    zoom.setAccessibleName(title + "：原始比例")
+    zoom.toggled.connect(scroll.set_full)
     layout.addWidget(zoom)
     return panel
 
 
-def review_dialog(parent, title, text, images):
+def review_dialog(parent, title, text, images, *, allow_accept=True, save_callback=None):
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
     layout = QVBoxLayout(dialog)
@@ -87,17 +107,34 @@ def review_dialog(parent, title, text, images):
     for image, caption in images:
         row.addWidget(image_label(image, caption))
     layout.addLayout(row)
-    buttons = QDialogButtonBox(
-        QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
-    )
-    buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并继续")
-    buttons.button(QDialogButtonBox.StandardButton.Ok).setAutoDefault(False)
+    choices = QDialogButtonBox.StandardButton.Cancel
+    if allow_accept:
+        choices |= QDialogButtonBox.StandardButton.Ok
+    buttons = QDialogButtonBox(choices)
+    buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+    if allow_accept:
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并继续")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setAutoDefault(False)
+    else:
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("关闭（不合成）")
+    if save_callback is not None:
+        save = buttons.addButton("另存完整 AI 返回图…", QDialogButtonBox.ButtonRole.ActionRole)
+        save.setObjectName("saveAiReturned")
+        save.setAccessibleName("另存完整 AI 返回图")
+        save.setAutoDefault(False)
+        save.clicked.connect(save_callback)
     buttons.button(QDialogButtonBox.StandardButton.Cancel).setDefault(True)
     buttons.accepted.connect(dialog.accept)
     buttons.rejected.connect(dialog.reject)
     layout.addWidget(buttons)
-    dialog.resize(780, 490)
-    return dialog.exec() == QDialog.DialogCode.Accepted
+    available = dialog.screen().availableGeometry()
+    dialog.resize(
+        min(1000 if len(images) > 2 else 780, available.width() - 32),
+        min(540, available.height() - 48),
+    )
+    accepted = dialog.exec() == QDialog.DialogCode.Accepted
+    dialog.deleteLater()
+    return allow_accept and accepted
 
 
 class AiSettingsDialog(QDialog):

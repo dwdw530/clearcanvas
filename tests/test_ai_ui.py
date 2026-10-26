@@ -3,17 +3,24 @@ from io import BytesIO
 import numpy as np
 import pytest
 from PIL import Image
-from PySide6.QtCore import QObject, QSettings, QTimer, Signal
-from PySide6.QtWidgets import QDialogButtonBox, QFileDialog, QMessageBox
+from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
+from PySide6.QtWidgets import (
+    QCheckBox,
+    QDialog,
+    QDialogButtonBox,
+    QFileDialog,
+    QMessageBox,
+    QPushButton,
+)
 from test_ai_repair import response
 from test_ai_settings import MemoryCredentials
 
-from clearcanvas import ai_repair, ai_settings_dialog
+from clearcanvas import ai_controller, ai_repair, ai_settings_dialog
 from clearcanvas.ai_service import AiRequest
 from clearcanvas.ai_settings import AiConfig, AiSettings
 from clearcanvas.ai_settings_dialog import AiSettingsDialog
 from clearcanvas.documents import DocumentError
-from clearcanvas.repair import repair_document
+from clearcanvas.repair import repair_document, source_stamp
 
 
 class FakeService(QObject):
@@ -216,6 +223,206 @@ def test_uncertain_alignment_decline_blocks_new_result(qtbot, ai_window, sample_
     assert window.editor.result is None
     assert not window.editor.export_button.isEnabled()
     assert len(service.requests) == 1
+
+
+@pytest.mark.parametrize("state", ["rejected", "uncertain", "corrected"])
+def test_paid_return_review_save_preserves_old_result_no_second_call(
+    qtbot, ai_window, sample_image, tmp_path, monkeypatch, state
+):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+    old = repair_document(window._preview, window.canvas.regions, source_stamp(sample_image))
+    window.editor.result = old
+    output = tmp_path / "returned.png"
+    original = sample_image.read_bytes()
+    checked = []
+
+    def validate(plan, raw, cancelled):
+        image = ai_repair.decode_response(raw)
+        value = ai_repair.AiValidated(
+            image.copy() if state == "corrected" else image,
+            state,
+            image if state == "corrected" else None,
+            5.0 if state == "corrected" else 0.0,
+        )
+        checked.append(value)
+        return value
+
+    def review(parent, title, text, images, *, allow_accept, save_callback):
+        assert ai.validated is checked[0]
+        assert allow_accept == (state != "rejected")
+        assert len(images) == (3 if state == "corrected" else 2)
+        assert save_callback()
+        # Even a caller erroneously returning True cannot override an explicit rejection.
+        return state == "rejected"
+
+    monkeypatch.setattr(ai_controller, "validate_response", validate)
+    monkeypatch.setattr(ai_controller, "review_dialog", review)
+    monkeypatch.setattr(ai, "confirm_alignment", ai.__class__.confirm_alignment.__get__(ai))
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(output), "PNG (*.png)"))
+    ai.mode.setCurrentIndex(1)
+    window.editor.start()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert window.editor.result is old
+    assert len(service.requests) == 1
+    assert sample_image.read_bytes() == original
+    with Image.open(output) as image, Image.open(BytesIO(service.requests[0].image)) as sent:
+        assert image.size == ai_repair.CANVAS
+        assert image.convert("RGB").tobytes() == sent.convert("RGB").tobytes()
+        assert not image.getexif() and not image.info
+    assert ai.plan is None and ai.validated is None
+    with pytest.raises(ValueError):
+        checked[0].returned_image.tobytes()
+
+
+@pytest.mark.parametrize("accepted", [False, True])
+def test_corrected_candidate_requires_review_and_export_is_local(
+    qtbot, ai_window, sample_image, tmp_path, monkeypatch, accepted
+):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+
+    def validate(plan, raw, cancelled):
+        image = ai_repair.decode_response(raw)
+        return ai_repair.AiValidated(image.copy(), "corrected", image, 5.0)
+
+    monkeypatch.setattr(ai_controller, "validate_response", validate)
+    monkeypatch.setattr(ai, "confirm_alignment", lambda: accepted)
+    ai.mode.setCurrentIndex(1)
+    window.editor.start()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert len(service.requests) == 1
+    if not accepted:
+        assert window.editor.result is None
+        assert not window.editor.export_button.isEnabled()
+        return
+    assert window.editor.result.ai_metadata["alignment"] == "corrected"
+    output = tmp_path / "corrected.png"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(output), "PNG (*.png)"))
+    window.editor.export()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert output.exists()
+    assert len(service.requests) == 1
+
+
+@pytest.mark.parametrize("target", ["original", "hardlink", "wrong-format", "cancel", "failure"])
+def test_return_save_refuses_original_aliases_and_failure_is_atomic(
+    qtbot, ai_window, sample_image, tmp_path, monkeypatch, target
+):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+    ai.active = True
+    ai.version = ai.store.version
+    ai.plan = ai_repair.prepare_plan(
+        window._preview, source_stamp(sample_image), window.canvas.regions, False
+    )
+    ai.validated = ai_repair.AiValidated(ai.plan.canvas.copy(), "rejected")
+    original = sample_image.read_bytes()
+    destination = tmp_path / "retained.png"
+    if target == "original":
+        destination = sample_image
+    elif target == "hardlink":
+        destination.hardlink_to(sample_image)
+    elif target == "wrong-format":
+        destination = tmp_path / "wrong.jpg"
+    elif target == "failure":
+        destination.write_bytes(b"existing result")
+
+        class FailedSave:
+            def __init__(self, path):
+                pass
+
+            def setDirectWriteFallback(self, enabled):
+                assert not enabled
+
+            def open(self, mode):
+                return True
+
+            def write(self, data):
+                return -1
+
+            def cancelWriting(self):
+                pass
+
+            def commit(self):
+                pytest.fail("Failed write must never be committed")
+
+        monkeypatch.setattr(ai_controller, "QSaveFile", FailedSave)
+    name = "" if target == "cancel" else str(destination)
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (name, "PNG (*.png)"))
+    try:
+        assert not ai.save_returned()
+        assert sample_image.read_bytes() == original
+        assert ai.validated.image.size == ai_repair.CANVAS
+        if target == "failure":
+            assert destination.read_bytes() == b"existing result"
+        elif target in {"wrong-format", "cancel"}:
+            assert not destination.exists()
+        assert not service.requests
+    finally:
+        ai._release()
+
+
+@pytest.mark.parametrize("allow_accept", [False, True])
+def test_return_dialog_save_keeps_review_open_and_keyboard_defaults_to_cancel(
+    qtbot, qapp, ai_window, allow_accept
+):
+    window, _, _ = ai_window
+    saved = []
+    inspected = []
+
+    def interact():
+        dialog = qapp.activeModalWidget()
+        try:
+            assert isinstance(dialog, QDialog)
+            buttons = dialog.findChild(QDialogButtonBox)
+            assert (buttons.button(QDialogButtonBox.StandardButton.Ok) is not None) == allow_accept
+            assert buttons.button(QDialogButtonBox.StandardButton.Cancel).isDefault()
+            save = dialog.findChild(QPushButton, "saveAiReturned")
+            assert save.isVisible() and save.accessibleName()
+            save.click()
+            assert dialog.isVisible()
+            assert saved == [True]
+            assert dialog.width() <= dialog.screen().availableGeometry().width()
+            inspected.append(True)
+            qtbot.keyClick(dialog, Qt.Key.Key_Return)
+        finally:
+            dialog.reject()
+
+    with Image.new("RGB", ai_repair.CANVAS, "white") as image:
+        QTimer.singleShot(10, interact)
+        assert not ai_settings_dialog.review_dialog(
+            window,
+            "返回图核对",
+            "另存不会再次调用接口；确认前不能合成。",
+            [(image, "上传图"), (image, "完整返回图")],
+            allow_accept=allow_accept,
+            save_callback=lambda: saved.append(True),
+        )
+    assert inspected == [True]
+
+
+def test_review_thumbnail_fits_whole_image_and_original_scale_remains_scrollable(qtbot):
+    with Image.new("RGB", ai_repair.CANVAS, "white") as image:
+        panel = ai_settings_dialog.image_label(image, "返回图")
+    panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+    qtbot.addWidget(panel)
+    panel.resize(240, 360)
+    panel.show()
+    view = panel.findChild(ai_settings_dialog._ReviewImage)
+    zoom = panel.findChild(QCheckBox)
+    qtbot.waitUntil(
+        lambda: view.horizontalScrollBar().maximum() == view.verticalScrollBar().maximum() == 0
+    )
+    assert view.image.pixmap().width() <= view.viewport().width()
+    assert view.image.pixmap().height() <= view.viewport().height()
+    zoom.setChecked(True)
+    assert (view.image.pixmap().width(), view.image.pixmap().height()) == ai_repair.CANVAS
+    qtbot.waitUntil(lambda: view.horizontalScrollBar().maximum() > 0)
+    zoom.setChecked(False)
+    qtbot.waitUntil(
+        lambda: view.horizontalScrollBar().maximum() == view.verticalScrollBar().maximum() == 0
+    )
 
 
 def test_pdf_forces_local_and_image_does_not_restore_cloud(

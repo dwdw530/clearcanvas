@@ -20,6 +20,7 @@ from clearcanvas.repair import _make_result, source_stamp
 
 CANVAS = (1536, 1024)
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
+MAX_CORRECTION_PIXELS = 12
 
 
 def check_cancel(cancelled):
@@ -232,8 +233,10 @@ def decode_response(raw, expected=CANVAS):
         ) from None
 
 
-def alignment_status(plan, returned):
-    """Conservative candidate thresholds, not facial fidelity certification."""
+def _alignment_check(plan, returned):
+    """Estimate only from protected content, never from padding or repair pixels."""
+    if returned.size != plan.canvas.size:
+        return "rejected", None, 0.0
     original = np.array(plan.canvas)
     result = np.array(returned)
     protected = np.array(plan.remote_mask.getchannel("A")) == 255
@@ -249,58 +252,144 @@ def alignment_status(plan, returned):
     protected &= content >= 250
     valid = cv2.erode(protected.astype(np.uint8) * 255, np.ones((17, 17), np.uint8))
     if np.count_nonzero(valid) < 10000:
-        return "uncertain"
+        return "uncertain", None, 0.0
     orb = cv2.ORB_create(nfeatures=1600)
     a, da = orb.detectAndCompute(cv2.cvtColor(original, cv2.COLOR_RGB2GRAY), valid)
     b, db = orb.detectAndCompute(cv2.cvtColor(result, cv2.COLOR_RGB2GRAY), valid)
     if da is None or db is None or len(a) < 20 or len(b) < 20:
-        return "uncertain"
+        return "uncertain", None, 0.0
     pairs = cv2.BFMatcher(cv2.NORM_HAMMING).knnMatch(da, db, k=2)
     matches = [
         pair[0] for pair in pairs if len(pair) == 2 and pair[0].distance < 0.7 * pair[1].distance
     ]
     if len(matches) < 20:
-        return "uncertain"
+        return "uncertain", None, 0.0
     src = np.float32([a[m.queryIdx].pt for m in matches])
     dst = np.float32([b[m.trainIdx].pt for m in matches])
     matrix, inliers = cv2.estimateAffinePartial2D(
         src, dst, method=cv2.RANSAC, ransacReprojThreshold=2
     )
-    if matrix is None or inliers.sum() < 16 or inliers.mean() < 0.6:
-        return "uncertain"
+    if matrix is None or inliers is None or inliers.sum() < 16 or inliers.mean() < 0.6:
+        return "uncertain", None, 0.0
     points = src[inliers.ravel() != 0]
-    if np.prod(np.ptp(points, axis=0)) < (x2 - x1) * (y2 - y1) * 0.2:
-        return "uncertain"
+    spread = np.prod(np.ptp(points, axis=0)) / ((x2 - x1) * (y2 - y1))
+    if spread < 0.2:
+        return "uncertain", None, 0.0
     corners = np.float32([[x1, y1], [x2, y1], [x1, y2], [x2, y2]])
     mapped = corners @ matrix[:, :2].T + matrix[:, 2]
-    if np.max(np.linalg.norm(mapped - corners, axis=1)) > 3:
-        return "rejected"
-    return "aligned"
+    displacement = float(np.max(np.linalg.norm(mapped - corners, axis=1)))
+    if displacement <= 3:
+        return "aligned", matrix, displacement
+    scale = math.hypot(matrix[0, 0], matrix[1, 0])
+    rotation = math.degrees(math.atan2(matrix[1, 0], matrix[0, 0]))
+    quadrants = (points[:, 0] >= (x1 + x2) / 2).astype(np.uint8)
+    quadrants += 2 * (points[:, 1] >= (y1 + y2) / 2).astype(np.uint8)
+    strong = (
+        inliers.sum() >= 40
+        and inliers.mean() >= 0.75
+        and spread >= 0.35
+        and np.count_nonzero(np.bincount(quadrants, minlength=4) >= 4) >= 3
+    )
+    if (
+        strong
+        and displacement <= MAX_CORRECTION_PIXELS
+        and abs(scale - 1) <= 0.005
+        and abs(rotation) <= 0.25
+    ):
+        return "correctable", matrix, displacement
+    return "rejected", matrix, displacement
+
+
+def alignment_status(plan, returned):
+    """Conservative candidate thresholds, not facial fidelity certification."""
+    return _alignment_check(plan, returned)[0]
+
+
+def _correction_covers_mask(plan, matrix):
+    x1, y1, x2, y2 = plan.content
+    cx1, cy1, cx2, cy2 = plan.crop
+    needed = np.zeros((CANVAS[1], CANVAS[0]), np.uint8)
+    # Area sampling includes small original mask strokes lost by nearest-neighbor upload masks.
+    needed[y1:y2, x1:x2] = cv2.resize(
+        plan.mask[cy1:cy2, cx1:cx2], (x2 - x1, y2 - y1), interpolation=cv2.INTER_AREA
+    )
+    # Include interpolation support; never invent missing edge content by border replication.
+    needed = cv2.dilate(needed, np.ones((9, 9), np.uint8))
+    available = np.zeros(needed.shape, np.uint8)
+    # Letterbox padding is not evidence that displaced source content survived.
+    available[y1:y2, x1:x2] = 255
+    coverage = cv2.warpAffine(
+        available,
+        matrix,
+        CANVAS,
+        flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=0,
+    )
+    return bool(np.all(coverage[needed != 0] == 255))
 
 
 @dataclass
 class AiValidated:
     image: Image.Image = field(repr=False)
     alignment: str
+    raw_image: Image.Image | None = field(default=None, repr=False)
+    displacement: float = 0.0
+
+    @property
+    def returned_image(self):
+        return self.raw_image if self.raw_image is not None else self.image
+
+    def close(self):
+        self.image.close()
+        if self.raw_image is not None and self.raw_image is not self.image:
+            self.raw_image.close()
 
 
 def validate_response(plan, raw, cancelled=lambda: False):
     check_cancel(cancelled)
     image = decode_response(raw)
+    corrected = None
     try:
-        state = alignment_status(plan, image)
+        try:
+            state, matrix, displacement = _alignment_check(plan, image)
+        except cv2.error:
+            state, matrix, displacement = "uncertain", None, 0.0
+        if state == "correctable":
+            state = "rejected"
+            try:
+                if _correction_covers_mask(plan, matrix):
+                    corrected = Image.fromarray(
+                        cv2.warpAffine(
+                            np.array(image),
+                            matrix,
+                            CANVAS,
+                            flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
+                            borderMode=cv2.BORDER_CONSTANT,
+                        )
+                    )
+                    if alignment_status(plan, corrected) == "aligned":
+                        state = "corrected"
+            except cv2.error:
+                pass  # Keep the paid response for review; failed correction cannot be composed.
         check_cancel(cancelled)
-        if state == "rejected":
-            raise DocumentError("返回图存在明显位移或构图变化，已拒绝合成。", "alignment")
-        return AiValidated(image, state)
+        if state == "corrected":
+            return AiValidated(corrected, state, image, displacement)
+        if corrected is not None:
+            corrected.close()
+        return AiValidated(image, state, displacement=displacement)
     except Exception:
         image.close()
+        if corrected is not None:
+            corrected.close()
         raise
 
 
 def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: False):
     check_cancel(cancelled)
-    if validated.alignment != "aligned" and not (validated.alignment == "uncertain" and confirmed):
+    if validated.alignment != "aligned" and not (
+        validated.alignment in {"uncertain", "corrected"} and confirmed
+    ):
         raise DocumentError("需核对对齐，确认前不能合成或导出。", "alignment")
     if plan.original is None:
         raise DocumentError("接口测试图不能作为文档结果导出。")
@@ -327,6 +416,10 @@ def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: F
             "canvas": CANVAS,
             "source_size": (pixels.shape[1], pixels.shape[0]),
             "downsampled": plan.downsampled,
+            "alignment": validated.alignment,
+            "correction_pixels": (
+                validated.displacement if validated.alignment == "corrected" else 0
+            ),
         },
         message="云端 AI 预览完成；请检查五官与修复区，接口可用不等于画质合格。",
     )

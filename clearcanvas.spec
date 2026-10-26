@@ -19,6 +19,7 @@ a = Analysis(
         (str(assets / "COMPONENTS.txt"), "."),
         (str(assets / "gmic"), "gmic"),
         (str(root / "README.md"), "."),
+        (str(root / "CHANGELOG.md"), "."),
         (str(root / "docs" / "product-design.md"), "docs"),
         (str(root / "docs" / "cloud-ai-design.md"), "docs"),
         (str(root / "docs" / "cloud-ai-candidate-report.md"), "docs"),
