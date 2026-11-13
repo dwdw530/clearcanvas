@@ -61,23 +61,28 @@ class AiPlan:
         self.mask = np.empty((0, 0), dtype=np.uint8)
 
 
-def plan_image(image, mask, *, preview=None, stamp=None, automatic=False, regions=()):
+def plan_image(
+    image, mask, *, preview=None, stamp=None, automatic=False, regions=(), allow_empty=False
+):
     width, height = image.size
     if width * height > MAX_IMAGE_PIXELS or mask.shape != (height, width):
         raise DocumentError("图片或蒙版尺寸超出安全限制。", "limit")
     mask = (mask != 0).astype(np.uint8) * 255
     ys, xs = np.nonzero(mask)
-    if not len(xs):
+    if not len(xs) and not allow_empty:
         raise DocumentError("未可靠识别到水印，请先框选；未上传图片。", "no_watermark")
     if len(xs) > min(width * height * 0.3, 2_000_000):
         raise DocumentError("选区过大，请缩小到水印附近分次处理。", "limit")
-    padding = max(96, math.ceil(max(xs.max() - xs.min(), ys.max() - ys.min()) * 0.4))
-    crop = (
-        max(0, int(xs.min()) - padding),
-        max(0, int(ys.min()) - padding),
-        min(width, int(xs.max()) + padding + 1),
-        min(height, int(ys.max()) + padding + 1),
-    )
+    if len(xs):
+        padding = max(96, math.ceil(max(xs.max() - xs.min(), ys.max() - ys.min()) * 0.4))
+        crop = (
+            max(0, int(xs.min()) - padding),
+            max(0, int(ys.min()) - padding),
+            min(width, int(xs.max()) + padding + 1),
+            min(height, int(ys.max()) + padding + 1),
+        )
+    else:
+        crop = (0, 0, width, height)
     x1, y1, x2, y2 = crop
     scale = min(CANVAS[0] / (x2 - x1), CANVAS[1] / (y2 - y1))
     size = (
@@ -121,7 +126,12 @@ def prepare_plan(preview, stamp, regions, automatic, cancelled=lambda: False):
             raise DocumentError("仅支持安全尺寸内的静态 PNG/JPEG。", "type")
         with ImageOps.exif_transpose(source) as oriented, oriented.convert("RGBA") as image:
             if automatic:
-                mask = detect_watermark(image, cancelled).mask
+                try:
+                    mask = detect_watermark(image, cancelled).mask
+                except DocumentError as error:
+                    if error.code != "no_watermark":
+                        raise
+                    mask = np.zeros((image.height, image.width), np.uint8)
             else:
                 mask = np.zeros((image.height, image.width), np.uint8)
                 for left, top, right, bottom in regions:
@@ -144,7 +154,8 @@ def prepare_plan(preview, stamp, regions, automatic, cancelled=lambda: False):
                     mask[y1:y2, x1:x2] = 255
             check_cancel(cancelled)
             plan = plan_image(
-                image, mask, preview=preview, stamp=stamp, automatic=automatic, regions=regions
+                image, mask, preview=preview, stamp=stamp, automatic=automatic, regions=regions,
+                allow_empty=True,
             )
     if source_stamp(path) != stamp:
         plan.close()
@@ -164,14 +175,14 @@ def test_plan(cancelled=lambda: False):
         return plan_image(image, mask)
 
 
-def encode_plan(plan, send_mask, cancelled=lambda: False):
+def encode_plan(plan, cancelled=lambda: False):
     check_cancel(cancelled)
+    check_repair_mask(plan, plan.mask)
     if plan.original and source_stamp(plan.original.info.path) != plan.stamp:
         raise DocumentError("原文件已变化，未提交请求。", "source")
     image = png_bytes(plan.canvas)
-    mask = png_bytes(plan.remote_mask) if send_mask else None
     check_cancel(cancelled)
-    return image, mask
+    return image
 
 
 def decode_response(raw, expected=CANVAS):
@@ -206,7 +217,7 @@ def decode_response(raw, expected=CANVAS):
                 or source.width * source.height > MAX_IMAGE_PIXELS
             ):
                 raise DocumentError("仅接受安全尺寸内的静态 PNG/JPEG。", "response")
-            if source.size != expected:
+            if expected is not None and source.size != expected:
                 raise DocumentError("返回画布尺寸不匹配，拒绝拉伸对齐。", "alignment")
         # n_frames/getexif may load PNG data; verify needs a freshly opened stream.
         with Image.open(BytesIO(image_bytes)) as source:
@@ -305,13 +316,14 @@ def alignment_status(plan, returned):
     return _alignment_check(plan, returned)[0]
 
 
-def _correction_covers_mask(plan, matrix):
+def _correction_covers_mask(plan, matrix, mask=None):
     x1, y1, x2, y2 = plan.content
     cx1, cy1, cx2, cy2 = plan.crop
     needed = np.zeros((CANVAS[1], CANVAS[0]), np.uint8)
     # Area sampling includes small original mask strokes lost by nearest-neighbor upload masks.
     needed[y1:y2, x1:x2] = cv2.resize(
-        plan.mask[cy1:cy2, cx1:cx2], (x2 - x1, y2 - y1), interpolation=cv2.INTER_AREA
+        (plan.mask if mask is None else mask)[cy1:cy2, cx1:cx2],
+        (x2 - x1, y2 - y1), interpolation=cv2.INTER_AREA
     )
     # Include interpolation support; never invent missing edge content by border replication.
     needed = cv2.dilate(needed, np.ones((9, 9), np.uint8))
@@ -335,6 +347,7 @@ class AiValidated:
     alignment: str
     raw_image: Image.Image | None = field(default=None, repr=False)
     displacement: float = 0.0
+    correction: np.ndarray | None = field(default=None, repr=False)
 
     @property
     def returned_image(self):
@@ -348,7 +361,7 @@ class AiValidated:
 
 def validate_response(plan, raw, cancelled=lambda: False):
     check_cancel(cancelled)
-    image = decode_response(raw)
+    image = decode_response(raw, expected=None)
     corrected = None
     try:
         try:
@@ -374,7 +387,7 @@ def validate_response(plan, raw, cancelled=lambda: False):
                 pass  # Keep the paid response for review; failed correction cannot be composed.
         check_cancel(cancelled)
         if state == "corrected":
-            return AiValidated(corrected, state, image, displacement)
+            return AiValidated(corrected, state, image, displacement, matrix)
         if corrected is not None:
             corrected.close()
         return AiValidated(image, state, displacement=displacement)
@@ -385,7 +398,61 @@ def validate_response(plan, raw, cancelled=lambda: False):
         raise
 
 
-def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: False):
+def check_repair_mask(plan, mask, *, received=False):
+    if mask.shape != plan.mask.shape:
+        raise DocumentError("修复范围与原图尺寸不一致。", "mask")
+    area = np.count_nonzero(mask)
+    if not area:
+        raise DocumentError("请先补选需要去除的水印；目前没有修复范围。", "no_watermark")
+    if area > min(mask.size * 0.3, 2_000_000):
+        raise DocumentError("修复范围过大，请缩小范围。", "limit")
+    if received:
+        x1, y1, x2, y2 = plan.crop
+        if np.count_nonzero(mask[y1:y2, x1:x2]) != area:
+            raise DocumentError(
+                "新增范围超出已上传区域；请缩小范围，或另行确认重新生成（可能计费）。", "mask"
+            )
+    return (mask != 0).astype(np.uint8) * 255
+
+
+def replan(plan, mask, cancelled=lambda: False):
+    check_cancel(cancelled)
+    mask = check_repair_mask(plan, mask)
+    with Image.fromarray(plan.pixels) as image:
+        return plan_image(
+            image, mask, preview=plan.original, stamp=plan.stamp,
+            automatic=plan.automatic, regions=plan.regions,
+        )
+
+
+def _match_boundary_colors(original, returned, mask, cancelled):
+    """Extend only protected color differences into each hole, retaining AI detail."""
+    output = returned
+    joined = cv2.dilate(mask, np.ones((9, 9), np.uint8))
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(joined, 8)
+    for label in range(1, count):
+        check_cancel(cancelled)
+        x, y, w, h, _ = stats[label]
+        x1, y1 = max(0, x - 16), max(0, y - 16)
+        x2, y2 = min(mask.shape[1], x + w + 16), min(mask.shape[0], y + h + 16)
+        local = mask[y1:y2, x1:x2]
+        selected = (local != 0) & (labels[y1:y2, x1:x2] == label)
+        # Other holes and transparent pixels cannot provide background colors.
+        excluded = ((local != 0) | (original[y1:y2, x1:x2, 3] < 250)).astype(np.uint8)
+        if not np.any(excluded == 0):
+            continue  # No opaque color reference; the mandatory preview remains unadjusted.
+        for channel in range(3):
+            check_cancel(cancelled)
+            source = returned[y1:y2, x1:x2, channel].astype(np.float32)
+            difference = original[y1:y2, x1:x2, channel].astype(np.float32) - source
+            difference[excluded != 0] = 0
+            correction = cv2.inpaint(difference, excluded, 3, cv2.INPAINT_NS)
+            values = np.clip(np.rint(source[selected] + correction[selected]), 0, 255)
+            output[y1:y2, x1:x2, channel][selected] = values.astype(np.uint8)
+    return output
+
+
+def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: False, mask=None):
     check_cancel(cancelled)
     if validated.alignment != "aligned" and not (
         validated.alignment in {"uncertain", "corrected"} and confirmed
@@ -395,12 +462,21 @@ def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: F
         raise DocumentError("接口测试图不能作为文档结果导出。")
     if source_stamp(plan.original.info.path) != plan.stamp:
         raise DocumentError("处理期间原文件发生变化，请重新打开。", "source")
+    mask = check_repair_mask(plan, plan.mask if mask is None else mask, received=True)
+    if validated.correction is not None and not _correction_covers_mask(
+        plan, validated.correction, mask
+    ):
+        raise DocumentError("新增范围缺少校正后的图像内容，请缩小范围。", "alignment")
     x1, y1, x2, y2 = plan.crop
     with validated.image.crop(plan.content) as content:
         with content.resize((x2 - x1, y2 - y1), Image.Resampling.LANCZOS) as restored:
             pixels = plan.pixels.copy()
-            selected = plan.mask[y1:y2, x1:x2] != 0
-            pixels[y1:y2, x1:x2, :3][selected] = np.array(restored)[selected]
+            local_mask = mask[y1:y2, x1:x2]
+            matched = _match_boundary_colors(
+                plan.pixels[y1:y2, x1:x2], np.array(restored), local_mask, cancelled
+            )
+            selected = local_mask != 0
+            pixels[y1:y2, x1:x2, :3][selected] = matched[selected]
     # Never feather outside M, never modify alpha (including inside M).
     check_cancel(cancelled)
     return _make_result(
@@ -421,5 +497,5 @@ def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: F
                 validated.displacement if validated.alignment == "corrected" else 0
             ),
         },
-        message="云端 AI 预览完成；请检查五官与修复区，接口可用不等于画质合格。",
+        message="AI 本地合成预览；修复范围外不变，请检查五官、纹理和接缝后再保存。",
     )

@@ -56,13 +56,11 @@ def test_crop_padding_mask_and_metadata(plan):
     outside[y1:y2, x1:x2] = False
     assert np.all(alpha[outside] == 255)
     assert np.any(alpha[y1:y2, x1:x2] == 0)
-    image, mask = ai.encode_plan(plan, True)
-    for data in (image, mask):
-        with Image.open(BytesIO(data)) as decoded:
-            assert decoded.size == ai.CANVAS
-            assert not decoded.getexif()
-            assert not decoded.info
-    assert ai.encode_plan(plan, False)[1] is None
+    encoded = ai.encode_plan(plan)
+    with Image.open(BytesIO(encoded)) as decoded:
+        assert decoded.size == ai.CANVAS
+        assert not decoded.getexif()
+        assert not decoded.info
 
 
 @pytest.mark.parametrize("size", [(200, 700), (2700, 1700), (2000, 2000), (700, 200)])
@@ -85,7 +83,6 @@ def test_mapping_truth_and_strict_rgba_protection(tmp_path, size):
     output = np.array(result.image)
     assert np.array_equal(output[mask == 0], pixels[mask == 0])
     assert np.array_equal(output[:, :, 3], pixels[:, :, 3])
-    assert np.all(output[:, :, :3][mask != 0] == (7, 111, 229))
     dest = tmp_path / "result.png"
     export_result(result, dest)
     assert np.array_equal(np.array(Image.open(dest)), output)
@@ -97,15 +94,67 @@ def test_mapping_truth_and_strict_rgba_protection(tmp_path, size):
     plan.close()
 
 
-def test_inverse_transform_uses_content_not_padding(plan):
+@pytest.mark.parametrize("offset", [(24, -15, 18), (-18, 20, -12)])
+def test_color_shift_does_not_recreate_watermark_silhouette(tmp_path, offset):
+    yy, xx = np.mgrid[:400, :640]
+    clean = np.stack(
+        (100 + xx / 12, 110 + yy / 10, 130 + 5 * np.sin(xx / 15)), axis=2
+    ).astype(np.uint8)
+    mask = np.zeros((400, 640), np.uint8)
+    mask[50:110, :30] = 255
+    mask[170:220, 250:330] = 255
+    mask[345:370, 590:620] = 255
+    original = np.full((400, 640, 4), 255, np.uint8)
+    original[:, :, :3] = clean
+    original[mask != 0, :3] = (255, 0, 100)
+    path = tmp_path / "color-shift.png"
+    with Image.fromarray(original) as image:
+        image.save(path)
+        plan = ai.plan_image(image, mask, preview=render_document(path), stamp=source_stamp(path))
+    returned_pixels = np.clip(clean.astype(int) + offset, 0, 255).astype(np.uint8)
     returned = Image.new("RGB", ai.CANVAS, "red")
-    x1, y1, x2, y2 = plan.content
-    with Image.new("RGB", (x2 - x1, y2 - y1), (10, 90, 180)) as content:
-        returned.paste(content, (x1, y1))
+    left, top, right, bottom = plan.content
+    with Image.fromarray(returned_pixels) as clean_image:
+        with clean_image.resize((right - left, bottom - top), Image.Resampling.LANCZOS) as content:
+            returned.paste(content, (left, top))
     result = ai.compose_result(plan, ai.AiValidated(returned, "aligned"), AiConfig())
-    assert np.all(np.array(result.image)[:, :, :3][plan.mask != 0] == (10, 90, 180))
-    returned.close()
-    result.image.close()
+    try:
+        actual = np.array(result.image)
+        error = np.abs(actual[:, :, :3].astype(int) - clean.astype(int))
+        assert np.percentile(error[mask != 0], 99) <= 4
+        assert np.array_equal(actual[mask == 0], original[mask == 0])
+        assert np.array_equal(actual[:, :, 3], original[:, :, 3])
+    finally:
+        result.image.close()
+        returned.close()
+        plan.close()
+
+
+def test_safe_wrong_size_return_is_retained_but_cannot_be_composed(plan):
+    with Image.new("RGB", (512, 512), "blue") as image:
+        validated = ai.validate_response(plan, response(image))
+        try:
+            assert validated.alignment == "rejected"
+            assert validated.returned_image.tobytes() == image.tobytes()
+            with pytest.raises(DocumentError):
+                ai.compose_result(plan, validated, AiConfig(), confirmed=True)
+        finally:
+            validated.close()
+
+
+def test_offline_range_cannot_extend_outside_uploaded_crop(plan):
+    selected = plan.mask.copy()
+    selected[0, 0] = 255
+    validated = ai.AiValidated(plan.canvas.copy(), "aligned")
+    try:
+        with pytest.raises(DocumentError, match="已上传区域"):
+            ai.compose_result(plan, validated, AiConfig(), mask=selected)
+        selected[0, 0] = 0
+        selected[plan.mask != 0] = 0
+        with pytest.raises(DocumentError, match="修复范围"):
+            ai.compose_result(plan, validated, AiConfig(), mask=selected)
+    finally:
+        validated.close()
 
 
 def test_exif_orientation_and_manual_selection(tmp_path):
@@ -119,7 +168,7 @@ def test_exif_orientation_and_manual_selection(tmp_path):
     plan = ai.prepare_plan(preview, source_stamp(path), [(0.1, 0.1, 0.2, 0.2)], False)
     assert plan.pixels.shape == (100, 200, 4)
     assert np.count_nonzero(plan.mask) == 200
-    assert b"PRIVATE" not in ai.encode_plan(plan, False)[0]
+    assert b"PRIVATE" not in ai.encode_plan(plan)
     plan.close()
 
 
@@ -242,7 +291,6 @@ def test_small_shift_corrected_only_after_review_with_rgba_protection(textured_p
     output = np.array(result.image)
     assert np.array_equal(output[plan.mask == 0], plan.pixels[plan.mask == 0])
     assert np.array_equal(output[:, :, 3], plan.pixels[:, :, 3])
-    assert np.array_equal(output[450, 710, :3], (7, 111, 229))
     assert result.ai_metadata["alignment"] == "corrected"
     assert result.ai_metadata["correction_pixels"] == checked.displacement
     result.image.close()
@@ -356,7 +404,7 @@ def test_source_change_cancel_no_watermark_and_area_limits(plan, tmp_path):
     result = ai.compose_result(plan, checked, AiConfig())
     plan.original.info.path.write_bytes(b"changed")
     for op in (
-        lambda: ai.encode_plan(plan, False),
+        lambda: ai.encode_plan(plan),
         lambda: ai.compose_result(plan, checked, AiConfig()),
         lambda: export_result(result, tmp_path / "out.png"),
     ):
@@ -368,7 +416,7 @@ def test_source_change_cancel_no_watermark_and_area_limits(plan, tmp_path):
             with pytest.raises(DocumentError):
                 ai.plan_image(image, mask)
     with pytest.raises(DocumentError) as error:
-        ai.encode_plan(plan, False, lambda: True)
+        ai.encode_plan(plan, lambda: True)
     assert error.value.code == "cancelled"
     result.image.close()
     checked.image.close()

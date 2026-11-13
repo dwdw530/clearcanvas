@@ -56,7 +56,6 @@ class AiConfig:
     model: str = "gpt-image-2"
     size: str = "1536x1024"
     quality: str = "high"
-    send_mask: bool = False
     timeout: int = 300
 
     @property
@@ -75,8 +74,6 @@ class AiConfig:
             raise DocumentError("尚未验证其他请求预设。", "preset")
         if type(self.timeout) is not int or not 60 <= self.timeout <= 600:
             raise DocumentError("总超时应为 60–600 秒。", "timeout")
-        if type(self.send_mask) is not bool:
-            raise DocumentError("蒙版选项无效。", "mask")
         return replace(self, root=root)
 
 
@@ -224,6 +221,7 @@ class AiSettings:
         else:
             self.credentials.delete(config.root)
         self._keys[config.root] = "" if delete else key
+        self.settings.remove("send_mask")
         for name, value in asdict(config).items():
             self.settings.setValue(name, value)
         self.settings.setValue("remember", bool(remember and not delete))

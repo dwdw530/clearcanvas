@@ -98,7 +98,10 @@ def image_label(image, title):
     return panel
 
 
-def review_dialog(parent, title, text, images, *, allow_accept=True, save_callback=None):
+def review_dialog(
+    parent, title, text, images, *, allow_accept=True, save_callback=None,
+    accept_text="使用此结果（不联网）", cancel_text="暂不使用，保留返回图",
+):
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
     layout = QVBoxLayout(dialog)
@@ -111,12 +114,12 @@ def review_dialog(parent, title, text, images, *, allow_accept=True, save_callba
     if allow_accept:
         choices |= QDialogButtonBox.StandardButton.Ok
     buttons = QDialogButtonBox(choices)
-    buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("取消")
+    buttons.button(QDialogButtonBox.StandardButton.Cancel).setText(cancel_text)
     if allow_accept:
-        buttons.button(QDialogButtonBox.StandardButton.Ok).setText("确认并继续")
+        buttons.button(QDialogButtonBox.StandardButton.Ok).setText(accept_text)
         buttons.button(QDialogButtonBox.StandardButton.Ok).setAutoDefault(False)
     else:
-        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("关闭（不合成）")
+        buttons.button(QDialogButtonBox.StandardButton.Cancel).setText("关闭，保留返回图")
     if save_callback is not None:
         save = buttons.addButton("另存完整 AI 返回图…", QDialogButtonBox.ButtonRole.ActionRole)
         save.setObjectName("saveAiReturned")
@@ -186,10 +189,10 @@ class AiSettingsDialog(QDialog):
         form.addRow("请求预设", plain_label("1536×1024 / high / 单图候选"))
         self.advanced = QGroupBox("高级选项")
         advanced = QFormLayout(self.advanced)
-        self.mask = QCheckBox("提交蒙版（默认关闭）")
-        self.mask.setChecked(store.config.send_mask)
-        advanced.addRow(self.mask)
-        advanced.addRow(plain_label("仅在中转文档或接口测试确认支持时启用，不会自动探测。"))
+        advanced.addRow("接口兼容方式", plain_label("图片编辑；不发送区域文件。"))
+        advanced.addRow(plain_label(
+            "当前仅启用已验证的请求格式，无需设置蒙版。修复范围由软件在本地保护。"
+        ))
         self.timeout = QSpinBox()
         self.timeout.setRange(60, 600)
         self.timeout.setSuffix(" 秒")
@@ -199,7 +202,7 @@ class AiSettingsDialog(QDialog):
         self.error = plain_label(store.warning)
         self.error.setObjectName("aiError")
         form.addRow(self.error)
-        self.status = plain_label("尚未验证；真实接口和去水印画质需分别验收。")
+        self.status = plain_label("可直接保存使用。接口测试是可选的，会生成测试图并可能计费。")
         form.addRow(self.status)
         form.addRow(plain_label("设置和本地处理不联网。取消只能停止本机等待，费用不保证撤销。"))
         scroll.setWidget(body)
@@ -222,7 +225,6 @@ class AiSettingsDialog(QDialog):
         for signal in (
             self.key.textChanged,
             self.model.textChanged,
-            self.mask.toggled,
             self.timeout.valueChanged,
         ):
             signal.connect(self._invalidate)
@@ -243,7 +245,7 @@ class AiSettingsDialog(QDialog):
 
     def _invalidate(self, *_):
         self.receipt = None
-        self.status.setText("尚未验证；真实效果待验证。")
+        self.status.setText("配置已变化；可直接保存使用，无需每次重新付费测试。")
 
     def _address_changed(self, *_):
         self._invalidate()
@@ -260,7 +262,6 @@ class AiSettingsDialog(QDialog):
         config = AiConfig(
             root=self.root.text(),
             model=self.model.text(),
-            send_mask=self.mask.isChecked(),
             timeout=self.timeout.value(),
         ).validated()
         if not self.deleted:

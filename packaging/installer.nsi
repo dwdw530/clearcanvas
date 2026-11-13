@@ -3,7 +3,7 @@ Unicode True
 !include "process_guard.nsh"
 
 Name "净界 ClearCanvas"
-OutFile "..\dist\ClearCanvas-0.4.1-Setup.exe"
+OutFile "..\dist\ClearCanvas-0.4.2-Setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\ClearCanvas"
 InstallDirRegKey HKCU "Software\ClearCanvas" "InstallDir"
 RequestExecutionLevel user
@@ -12,6 +12,12 @@ BrandingText "净界 ClearCanvas"
 !define MUI_ICON "..\artifacts\build\clearcanvas.ico"
 !define MUI_UNICON "..\artifacts\build\clearcanvas.ico"
 !define MUI_ABORTWARNING
+!ifndef BUNDLE_DIR
+  !define BUNDLE_DIR "..\dist\ClearCanvas"
+!endif
+!ifndef UNINSTALL_MANIFEST
+  !define UNINSTALL_MANIFEST "..\artifacts\build\uninstall-files.nsh"
+!endif
 !insertmacro MUI_PAGE_WELCOME
 !insertmacro MUI_PAGE_DIRECTORY
 !insertmacro MUI_PAGE_INSTFILES
@@ -32,7 +38,7 @@ Section "净界"
   Call RequireClearCanvasClosed
   SetShellVarContext current
   SetOutPath "$INSTDIR"
-  File /r "..\dist\ClearCanvas\*"
+  File /r "${BUNDLE_DIR}\*"
   WriteUninstaller "$INSTDIR\Uninstall.exe"
   CreateDirectory "$SMPROGRAMS\净界 ClearCanvas"
   CreateShortcut "$SMPROGRAMS\净界 ClearCanvas\净界.lnk" "$INSTDIR\ClearCanvas.exe"
@@ -40,7 +46,7 @@ Section "净界"
   CreateShortcut "$DESKTOP\净界.lnk" "$INSTDIR\ClearCanvas.exe"
   WriteRegStr HKCU "Software\ClearCanvas" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayName" "净界 ClearCanvas"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayVersion" "0.4.1"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayVersion" "0.4.2"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayIcon" "$INSTDIR\ClearCanvas.exe"
@@ -55,7 +61,7 @@ Section "Uninstall"
   ReadRegStr $0 HKCU "Software\ClearCanvas" "InstallDir"
   StrCmp $0 "$INSTDIR" +2
   Abort "安装路径不一致，已停止卸载。"
-  !include "..\artifacts\build\uninstall-files.nsh"
+  !include "${UNINSTALL_MANIFEST}"
   Delete "$INSTDIR\Uninstall.exe"
   RMDir "$INSTDIR"
   Delete "$DESKTOP\净界.lnk"

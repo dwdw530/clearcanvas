@@ -204,8 +204,10 @@ def _tighten_opaque_color_mask(pixels, mask, stencil):
     """
     if not np.any(stencil):
         return mask
-    stencil = cv2.resize(stencil, (mask.shape[1], mask.shape[0]),
-                         interpolation=cv2.INTER_NEAREST)
+    full_resolution = stencil.shape == mask.shape
+    if not full_resolution:
+        stencil = cv2.resize(stencil, (mask.shape[1], mask.shape[0]),
+                             interpolation=cv2.INTER_NEAREST)
     core = cv2.erode(stencil, np.ones((3, 3), np.uint8)) != 0
     if np.count_nonzero(core) < 64:
         return mask
@@ -239,6 +241,10 @@ def _tighten_opaque_color_mask(pixels, mask, stencil):
     for color in palette:
         same |= np.max(np.abs(values - color), axis=1) <= 24
     ink[yy[same], xx[same]] = 255
+    if full_resolution:
+        # These are measured ink pixels, including blended edges. A palette-only
+        # cutoff can drop them and leave a colored rim for the fill to extrapolate.
+        ink |= stencil
     # One original-resolution pixel retains antialiasing without erasing the
     # larger clean band introduced by resizing and conservative dilation.
     ink = cv2.dilate(ink, np.ones((3, 3), np.uint8))
@@ -332,19 +338,22 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
         for ids, _x, y, _w, _h, height, angle in groups:
             # A single top line is often a poster heading, not a watermark.
             near_edge = y > gray.shape[0] * 0.82
-            # Disjoint words on the same heading are not repeated watermarks.
+            centers = stats[:, :2] + stats[:, 2:4] / 2
+            direction = np.array([np.cos(np.radians(angle)), np.sin(np.radians(angle))])
+            along = centers @ direction
+            across = centers @ np.array([-direction[1], direction[0]])
+            baseline = np.median(across[ids])
+            # Compare text baselines, not screen rows: tilted copies may share y.
+            # Disjoint words on one heading still do not establish repetition.
             repeats = {
                 round(gy / max(height * 2, 1))
                 for other, _, gy, _, _, gh, ga in groups
                 if 0.65 <= gh / height <= 1.5
                 and abs(ga - angle) < 8
-                and abs(gy - y) > height * 2
+                and abs(np.median(across[other]) - baseline) > height * 2
                 and not np.intersect1d(ids, other).size
                 and _same_lettering(ids, other, labels, stats)
             }
-            centers = stats[:, :2] + stats[:, 2:4] / 2
-            direction = np.array([np.cos(np.radians(angle)), np.sin(np.radians(angle))])
-            along = centers @ direction
             # Scattered texture can fit a baseline without forming a continuous
             # caption. Repeated watermarks may legitimately span separate words.
             continuous = np.max(np.diff(np.sort(along[ids]))) <= height * 3.5
@@ -367,8 +376,6 @@ def detect_photo_watermark_mask(image: Image.Image, cancelled=lambda: False) -> 
                 neutral_lines.append((_x, y, _w, _h))
             else:
                 colored_lines.append((_x, y, _w, _h))
-            across = centers @ np.array([-direction[1], direction[0]])
-            baseline = np.median(across[ids])
             line = (
                 (valid != 0)
                 & (stats[:, 3] >= height * 0.45)

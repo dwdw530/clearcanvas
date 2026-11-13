@@ -1,5 +1,4 @@
 import threading
-from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
@@ -211,16 +210,7 @@ def test_cancel_late_response_singleflight_and_close(qtbot, factory):
         service.submit(AiRequest(AiConfig(), SECRET, b"png"))
 
 
-def test_mask_mismatch_does_not_send(qtbot, factory):
-    service, calls = factory()
-    _, _, error = run(
-        qtbot, service, AiRequest(replace(AiConfig(), send_mask=True), SECRET, b"png")
-    )
-    assert error and not calls
-
-
-@pytest.mark.parametrize("send_mask", [False, True])
-def test_real_multipart_serialization_loopback_only(qtbot, send_mask):
+def test_real_multipart_serialization_loopback_only(qtbot):
     captured = []
 
     class Handler(BaseHTTPRequestHandler):
@@ -249,9 +239,8 @@ def test_real_multipart_serialization_loopback_only(qtbot, send_mask):
 
     service = AiRepairService(manager_factory=Loopback)
     try:
-        config = replace(AiConfig(), send_mask=send_mask)
         _, data, error = run(
-            qtbot, service, AiRequest(config, SECRET, b"IMAGE", b"MASK" if send_mask else None)
+            qtbot, service, AiRequest(AiConfig(), SECRET, b"IMAGE")
         )
         assert error is None and data == b'{"data":[]}'
         assert len(captured) == 1
@@ -260,7 +249,7 @@ def test_real_multipart_serialization_loopback_only(qtbot, send_mask):
         assert headers["Content-Type"].startswith("multipart/form-data;")
         for name in ("model", "prompt", "size", "quality", "response_format", "image"):
             assert body.count(f'name="{name}"'.encode()) == 1
-        assert (b'name="mask"' in body) == send_mask
+        assert b'name="mask"' not in body
         assert b'filename="input.png"' in body
         assert b"1536x1024" in body and b"b64_json" in body and b"gpt-image-2" in body
         assert b'name="n"' not in body and b"input_fidelity" not in body

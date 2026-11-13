@@ -102,7 +102,6 @@ def test_reject_ambiguous_or_insecure_roots(address):
         {"timeout": 59},
         {"timeout": 601},
         {"timeout": True},
-        {"send_mask": "true"},
     ],
 )
 def test_config_validation(change):
@@ -186,6 +185,13 @@ def test_corrupt_settings_fail_safe(store):
     assert next_store.config == AiConfig()
     assert next_store.warning
 
+
+def test_obsolete_mask_setting_never_enables_unverified_request_parameter(store):
+    store.settings.setValue("send_mask", True)
+    reloaded = AiSettings(store.settings, store.credentials)
+    assert reloaded.config == AiConfig()
+    reloaded.save(reloaded.config, SECRET)
+    assert not reloaded.settings.contains("send_mask")
 
 def test_saved_credentials_root_scoped_reload_and_session_fallback(store):
     config = AiConfig()

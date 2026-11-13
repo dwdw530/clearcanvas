@@ -84,6 +84,9 @@ def ai_window(window, tmp_path, monkeypatch):
     controller.store = store
     monkeypatch.setattr(controller, "confirm_plan", lambda plan: True)
     monkeypatch.setattr(controller, "confirm_alignment", lambda: True)
+    monkeypatch.setattr(controller, "edit_range", lambda plan, mask, **kwargs: mask.copy())
+    monkeypatch.setattr(controller, "confirm_result", lambda result: True)
+    monkeypatch.setattr(controller, "confirm_exit", lambda: True)
     monkeypatch.setattr(QMessageBox, "question", lambda *a: QMessageBox.StandardButton.Yes)
     monkeypatch.setattr(QMessageBox, "warning", lambda *a: QMessageBox.StandardButton.Cancel)
     monkeypatch.setattr(QMessageBox, "information", lambda *a: QMessageBox.StandardButton.Ok)
@@ -248,7 +251,7 @@ def test_paid_return_review_save_preserves_old_result_no_second_call(
         checked.append(value)
         return value
 
-    def review(parent, title, text, images, *, allow_accept, save_callback):
+    def review(parent, title, text, images, *, allow_accept, save_callback, **kwargs):
         assert ai.validated is checked[0]
         assert allow_accept == (state != "rejected")
         assert len(images) == (3 if state == "corrected" else 2)
@@ -271,8 +274,10 @@ def test_paid_return_review_save_preserves_old_result_no_second_call(
         assert image.convert("RGB").tobytes() == sent.convert("RGB").tobytes()
         assert not image.getexif() and not image.info
     assert ai.plan is None and ai.validated is None
-    with pytest.raises(ValueError):
-        checked[0].returned_image.tobytes()
+    assert ai.received.validated is checked[0]
+    assert ai.received.saved
+    with Image.open(output) as saved:
+        assert checked[0].returned_image.tobytes() == saved.convert("RGB").tobytes()
 
 
 @pytest.mark.parametrize("accepted", [False, True])
@@ -311,12 +316,11 @@ def test_return_save_refuses_original_aliases_and_failure_is_atomic(
 ):
     window, ai, service = ai_window
     load_image(qtbot, window, sample_image)
-    ai.active = True
-    ai.version = ai.store.version
-    ai.plan = ai_repair.prepare_plan(
+    plan = ai_repair.prepare_plan(
         window._preview, source_stamp(sample_image), window.canvas.regions, False
     )
-    ai.validated = ai_repair.AiValidated(ai.plan.canvas.copy(), "rejected")
+    validated = ai_repair.AiValidated(plan.canvas.copy(), "rejected")
+    ai.received = ai_controller._Received(plan, validated, ai.store.config, plan.mask.copy())
     original = sample_image.read_bytes()
     destination = tmp_path / "retained.png"
     if target == "original":
@@ -353,14 +357,15 @@ def test_return_save_refuses_original_aliases_and_failure_is_atomic(
     try:
         assert not ai.save_returned()
         assert sample_image.read_bytes() == original
-        assert ai.validated.image.size == ai_repair.CANVAS
+        assert ai.received.validated.image.size == ai_repair.CANVAS
         if target == "failure":
             assert destination.read_bytes() == b"existing result"
         elif target in {"wrong-format", "cancel"}:
             assert not destination.exists()
         assert not service.requests
     finally:
-        ai._release()
+        ai.received.close()
+        ai.received = None
 
 
 @pytest.mark.parametrize("allow_accept", [False, True])
@@ -615,3 +620,126 @@ def test_original_file_modified_during_network_rejects_compose(qtbot, ai_window,
     qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
     assert window.editor.result is None
     assert len(service.requests) == 1
+
+
+def test_declined_composite_can_be_adjusted_without_another_request(
+    qtbot, ai_window, sample_image, tmp_path, monkeypatch
+):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+    old = repair_document(window._preview, window.canvas.regions, window.editor.stamp)
+    window.editor.result = old
+    ai.mode.setCurrentIndex(1)
+    monkeypatch.setattr(ai, "confirm_result", lambda result: False)
+    window.editor.start()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert window.editor.result is old
+    returned_pixels = ai.received.validated.returned_image.tobytes()
+    selected = ai.received.mask.copy()
+    selected[410:415, 535:540] = 255
+    monkeypatch.setattr(ai, "edit_range", lambda *args, **kwargs: selected)
+    monkeypatch.setattr(ai, "confirm_result", lambda result: True)
+    ai.store._keys.clear()
+    ai.store.version = "new-settings-version"
+    ai.review_received()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert window.editor.result is not old
+    assert ai.received.validated.returned_image.tobytes() == returned_pixels
+    assert np.array_equal(ai.received.mask, selected)
+    assert len(service.requests) == 1
+    output = tmp_path / "adjusted.png"
+    monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *args: (str(output), "PNG (*.png)"))
+    window.editor.export()
+    qtbot.waitUntil(lambda: not window.editor.busy and output.exists(), timeout=10000)
+    assert len(service.requests) == 1
+
+
+def test_empty_automatic_range_can_be_painted_before_first_upload(
+    qtbot, ai_window, sample_image, monkeypatch
+):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+    ai.mode.setCurrentIndex(1)
+
+    def no_marks(*args):
+        raise DocumentError("未识别", "no_watermark")
+
+    def paint(plan, mask, **kwargs):
+        assert not np.any(mask) and not service.requests
+        selected = mask.copy()
+        selected[410:425, 545:560] = 255
+        return selected
+
+    monkeypatch.setattr(ai_repair, "detect_watermark", no_marks)
+    monkeypatch.setattr(ai, "edit_range", paint)
+    window.editor.start_auto()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert window.editor.result is not None
+    assert np.all(ai.received.mask[410:425, 545:560])
+    assert len(service.requests) == 1
+
+
+def test_failed_regeneration_keeps_previous_paid_response(qtbot, ai_window, sample_image):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+    ai.mode.setCurrentIndex(1)
+    window.editor.start()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    first = ai.received
+    original = first.validated.returned_image.tobytes()
+    service.error = DocumentError("模拟新请求失败", "http")
+    window.editor.start()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    assert ai.received is first
+    assert first.validated.returned_image.tobytes() == original
+    assert len(service.requests) == 2
+
+
+def test_area_brush_edits_original_coordinates_and_cancel_preserves_mask(qtbot, sample_image):
+    from PySide6.QtCore import QPointF
+
+    from clearcanvas.ai_area_editor import AiAreaDialog
+    from clearcanvas.documents import render_document
+
+    plan = ai_repair.prepare_plan(
+        render_document(sample_image), source_stamp(sample_image), [(0.55, 0.65, 0.65, 0.7)], False
+    )
+    try:
+        original = plan.mask.copy()
+        dialog = AiAreaDialog(plan, original)
+        qtbot.addWidget(dialog)
+        dialog.show()
+        view = dialog.canvas
+        position = view.mapFromScene(QPointF(200, 200))
+        qtbot.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=position)
+        assert view.mask[200, 200] == 255
+        view.set_mode("擦除")
+        qtbot.mouseClick(view.viewport(), Qt.MouseButton.LeftButton, pos=position)
+        assert view.mask[200, 200] == 0
+        view.undo()
+        assert view.mask[200, 200] == 255
+        dialog.reject()
+        assert dialog.selection is None
+        assert np.array_equal(original, plan.mask)
+    finally:
+        plan.close()
+
+
+def test_exit_cancel_preserves_unsaved_paid_image(qtbot, ai_window, sample_image, monkeypatch):
+    window, ai, service = ai_window
+    load_image(qtbot, window, sample_image)
+    ai.mode.setCurrentIndex(1)
+    window.editor.start()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    original = ai.received.validated.returned_image.tobytes()
+    monkeypatch.setattr(ai, "confirm_exit", ai.__class__.confirm_exit.__get__(ai))
+
+    def cancel():
+        dialog = window.window().findChild(QMessageBox)
+        dialog.reject()
+
+    QTimer.singleShot(30, cancel)
+    assert not ai.confirm_exit()
+    assert ai.received.validated.returned_image.tobytes() == original
+    assert len(service.requests) == 1
+    monkeypatch.setattr(ai, "confirm_exit", lambda: True)

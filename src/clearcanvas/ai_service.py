@@ -25,7 +25,6 @@ class AiRequest:
     config: AiConfig
     key: str = field(repr=False)
     image: bytes = field(repr=False)
-    mask: bytes | None = field(default=None, repr=False)
 
 
 def multipart(request):
@@ -44,18 +43,14 @@ def multipart(request):
         )
         part.setBody(value.encode("utf-8"))
         parts.append(part)
-    for name, data in (("image", request.image), ("mask", request.mask)):
-        if data is None:
-            continue
-        part = QHttpPart()
-        filename = "input.png" if name == "image" else "mask.png"
-        part.setHeader(
-            QNetworkRequest.KnownHeaders.ContentDispositionHeader,
-            f'form-data; name="{name}"; filename="{filename}"',
-        )
-        part.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "image/png")
-        part.setBody(data)
-        parts.append(part)
+    part = QHttpPart()
+    part.setHeader(
+        QNetworkRequest.KnownHeaders.ContentDispositionHeader,
+        'form-data; name="image"; filename="input.png"',
+    )
+    part.setHeader(QNetworkRequest.KnownHeaders.ContentTypeHeader, "image/png")
+    part.setBody(request.image)
+    parts.append(part)
     return parts
 
 
@@ -111,8 +106,6 @@ class _NetworkWorker(QObject):
         try:
             config = request.config.validated()
             validate_key(request.key)
-            if config.send_mask != (request.mask is not None):
-                raise DocumentError("蒙版与请求配置不一致。")
             if self.manager is None:
                 self.manager = self.factory(self)
             wire = QNetworkRequest(QUrl(config.endpoint))

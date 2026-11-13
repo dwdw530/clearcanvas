@@ -44,7 +44,7 @@ class RepairController(QObject):
         bar.setIconSize(QSize(20, 20))
         window.addToolBarBreak()
         window.addToolBar(bar)
-        self.auto_button = QPushButton(icon("scan", "#ffffff"), "一键去水印")
+        self.auto_button = QPushButton(icon("scan", "#ffffff"), "本地一键去水印")
         self.auto_button.setObjectName("primaryButton")
         self.auto_button.setToolTip("自动识别当前图片或当前页的水印并生成预览")
         self.auto_button.clicked.connect(self.start_auto)

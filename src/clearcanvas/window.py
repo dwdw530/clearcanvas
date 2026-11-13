@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -268,7 +269,11 @@ class MainWindow(QMainWindow):
         self.addDockWidget(Qt.DockWidgetArea.LeftDockWidgetArea, self.file_dock)
         self.details = DocumentDetails()
         self.details_dock = QDockWidget("文件信息", self)
-        self.details_dock.setWidget(self.details)
+        details_scroll = QScrollArea()
+        details_scroll.setWidgetResizable(True)
+        details_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        details_scroll.setWidget(self.details)
+        self.details_dock.setWidget(details_scroll)
         self.details_dock.setMinimumWidth(220)
         self.details_dock.setMaximumWidth(350)
         self.details_dock.setFeatures(QDockWidget.DockWidgetFeature.DockWidgetClosable)
@@ -579,6 +584,8 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "任务进行中", "请先取消或等待当前任务完成后再退出。")
             return
         if not self.editor.can_leave():
+            return
+        if not self.editor.ai.confirm_exit():
             return
         self._token = -1
         try:

@@ -34,6 +34,64 @@ def photo_pair(color=255, opacity=255, corner=False):
     return clean, Image.alpha_composite(clean, layer)
 
 
+@pytest.mark.parametrize("angle", [-22, 22])
+@pytest.mark.parametrize("color", [(255, 0, 100), (255, 255, 255)])
+def test_tilted_repeated_watermarks_at_same_screen_height(angle, color):
+    clean, unused = photo_pair()
+    unused.close()
+    with clean, clean.copy() as marked, Image.new("RGBA", (360, 85)) as word:
+        ImageDraw.Draw(word).text((5, 5), "WATERMARK", fill=(*color, 255), font_size=44)
+        with word.rotate(angle, resample=Image.Resampling.BICUBIC, expand=True) as tilted:
+            for x in (20, 510):
+                marked.alpha_composite(tilted, (x, 240))
+        ink = np.max(np.abs(np.array(marked).astype(int) - np.array(clean)), axis=2) > 20
+        mask = detect_photo_watermark_mask(marked)
+        assert np.mean(mask[ink] != 0) > 0.98
+        nearby = cv2.dilate(ink.astype(np.uint8), np.ones((7, 7), np.uint8)) != 0
+        assert np.count_nonzero((mask != 0) & ~nearby) < ink.sum() * 0.05
+
+
+@pytest.mark.parametrize("angle", [-22, 22])
+def test_repeated_words_on_one_tilted_heading_are_preserved(angle):
+    clean, unused = photo_pair()
+    unused.close()
+    with clean, Image.new("RGBA", clean.size) as layer:
+        draw = ImageDraw.Draw(layer)
+        for x in (120, 530):
+            draw.text((x, 330), "WATERMARK", fill=(255, 0, 100, 255), font_size=30)
+        with layer.rotate(angle, resample=Image.Resampling.BICUBIC) as tilted:
+            clean.alpha_composite(tilted)
+        with pytest.raises(DocumentError) as error:
+            detect_photo_watermark_mask(clean)
+        assert error.value.code == "no_watermark"
+
+
+def test_resampled_colored_watermark_does_not_leave_complementary_ghost(tmp_path):
+    background = (95, 80, 60, 255)
+    path = tmp_path / "resampled.png"
+    with Image.new("RGBA", (2400, 1600), background) as large:
+        ImageDraw.Draw(large).text(
+            (1100, 1380), "WATERMARK", fill=(255, 0, 100, 255), font_size=104
+        )
+        with large.resize((1200, 800), Image.Resampling.LANCZOS) as marked:
+            marked.save(path)
+            original = np.array(marked)
+            mask = detect_photo_watermark_mask(marked)
+    digest = hashlib.sha256(path.read_bytes()).digest()
+    result = auto_repair_document(render_document(path), source_stamp(path))
+    try:
+        output = export_result(result, tmp_path / "result.png")
+        with Image.open(output) as exported:
+            actual = np.array(exported)
+        selected = mask != 0
+        error = np.max(np.abs(actual[:, :, :3].astype(int) - background[:3]), axis=2)
+        assert np.percentile(error[selected], 99) < 12
+        assert np.array_equal(actual[~selected], original[~selected])
+        assert hashlib.sha256(path.read_bytes()).digest() == digest
+    finally:
+        result.image.close()
+
+
 @pytest.mark.parametrize("hue", range(0, 180, 15))
 @pytest.mark.parametrize("opacity,corner", [(255, False), (160, True)])
 def test_photo_colored_ink_across_hue_wheel(hue, opacity, corner):
@@ -342,7 +400,6 @@ def test_photo_ui_one_click_and_export_without_selection(qtbot, window, tmp_path
     monkeypatch.setattr(QMessageBox, "warning", lambda *a: messages.append(a[2]) or QMessageBox.Ok)
     window.add_files([path])
     qtbot.waitUntil(lambda: window._preview is not None)
-    assert window.editor.auto_button.text() == "一键去水印"
     assert not window.canvas.regions
     window.editor.auto_button.click()
     qtbot.waitUntil(lambda: not window.editor.busy, timeout=15000)
