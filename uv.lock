@@ -17,7 +17,7 @@ wheels = [
 
 [[package]]
 name = "clearcanvas"
-version = "0.4.2"
+version = "0.4.3"
 source = { editable = "." }
 dependencies = [
     { name = "opencv-python-headless" },

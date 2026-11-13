@@ -13,9 +13,10 @@ from clearcanvas.documents import DocumentError
 
 MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 PROMPT = (
-    "删除图中水印并自然填补被覆盖区域。保持人物身份、姿势、构图、鼻孔、鼻翼、嘴唇、"
-    "肤色、头发和背景不变；不要美化、换脸、重构五官或添加文字。"
-    "保留非水印正文，不推测或补写被遮挡的原文。"
+    "仅删除现有水印并自然填补被覆盖区域。严格保留输入图片的画面边界、长宽比例和构图；"
+    "不要扩图、补画画外的衣服或背景，不要移动、缩放、拉伸人物。"
+    "保持人物身份、姿势、鼻孔、鼻翼、嘴唇、肤色、头发、光照和背景不变；"
+    "不要美化、换脸、重构五官或添加文字。保留非水印正文，不推测或补写被遮挡的原文。"
 )
 CANCEL_NOTICE = "取消只能停止本机等待，服务端可能仍在生成，已发生的费用不保证撤销。"
 
@@ -25,6 +26,7 @@ class AiRequest:
     config: AiConfig
     key: str = field(repr=False)
     image: bytes = field(repr=False)
+    size: tuple[int, int]
 
 
 def multipart(request):
@@ -32,7 +34,7 @@ def multipart(request):
     fields = {
         "model": request.config.model,
         "prompt": PROMPT,
-        "size": request.config.size,
+        "size": f"{request.size[0]}x{request.size[1]}",
         "quality": request.config.quality,
         "response_format": "b64_json",
     }

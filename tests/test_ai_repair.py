@@ -29,18 +29,19 @@ def plan(sample_image):
     value.close()
 
 
-@pytest.fixture
-def textured_plan(tmp_path):
+@pytest.fixture(params=[(1536, 1024), (1024, 1536)])
+def textured_plan(tmp_path, request):
     rng = np.random.default_rng(123)
-    pixels = np.full((1024, 1536, 4), 255, np.uint8)
-    pixels[:, :, :3] = rng.integers(0, 256, (1024, 1536, 3), np.uint8)
+    width, height = request.param
+    pixels = np.full((height, width, 4), 255, np.uint8)
+    pixels[:, :, :3] = rng.integers(0, 256, (height, width, 3), np.uint8)
     pixels[440:470, 700:740, 3] = 120
     path = tmp_path / "textured.png"
     with Image.fromarray(pixels) as image:
         image.save(path)
-    mask = np.zeros((1024, 1536), np.uint8)
+    mask = np.zeros((height, width), np.uint8)
     mask[40:60, 40:60] = 255
-    mask[980:1000, 1480:1500] = 255
+    mask[height - 44:height - 24, width - 56:width - 36] = 255
     mask[440:470, 700:740] = 255
     with Image.fromarray(pixels) as image:
         value = ai.plan_image(image, mask, preview=render_document(path), stamp=source_stamp(path))
@@ -48,8 +49,8 @@ def textured_plan(tmp_path):
     value.close()
 
 
-def test_crop_padding_mask_and_metadata(plan):
-    assert plan.canvas.size == ai.CANVAS == plan.remote_mask.size
+def test_native_upload_keeps_crop_pixels_and_strips_metadata(plan):
+    assert plan.canvas.size == plan.remote_mask.size
     x1, y1, x2, y2 = plan.content
     alpha = np.array(plan.remote_mask)[:, :, 3]
     outside = np.ones(alpha.shape, bool)
@@ -58,7 +59,9 @@ def test_crop_padding_mask_and_metadata(plan):
     assert np.any(alpha[y1:y2, x1:x2] == 0)
     encoded = ai.encode_plan(plan)
     with Image.open(BytesIO(encoded)) as decoded:
-        assert decoded.size == ai.CANVAS
+        cx1, cy1, cx2, cy2 = plan.crop
+        assert decoded.size == (cx2 - cx1, cy2 - cy1)
+        assert np.array_equal(np.array(decoded), plan.pixels[cy1:cy2, cx1:cx2, :3])
         assert not decoded.getexif()
         assert not decoded.info
 
@@ -78,8 +81,8 @@ def test_mapping_truth_and_strict_rgba_protection(tmp_path, size):
     mask[height - 40 : height - 20, width - 80 : width - 30] = 255
     with Image.fromarray(pixels) as image:
         plan = ai.plan_image(image, mask, preview=render_document(path), stamp=source_stamp(path))
-    with Image.new("RGB", ai.CANVAS, (7, 111, 229)) as returned:
-        result = ai.compose_result(plan, ai.AiValidated(returned, "uncertain"), AiConfig(), True)
+    with Image.new("RGB", plan.canvas.size, (7, 111, 229)) as returned:
+        result = ai.compose_result(plan, ai.AiValidated(returned, "aligned"), AiConfig())
     output = np.array(result.image)
     assert np.array_equal(output[mask == 0], pixels[mask == 0])
     assert np.array_equal(output[:, :, 3], pixels[:, :, 3])
@@ -89,7 +92,6 @@ def test_mapping_truth_and_strict_rgba_protection(tmp_path, size):
     assert hashlib.sha256(path.read_bytes()).digest() == digest
     assert result.backend == "cloud_ai"
     assert "key" not in str(result.ai_metadata).lower()
-    assert plan.downsampled == (max(size) > 1536)
     result.image.close()
     plan.close()
 
@@ -112,7 +114,7 @@ def test_color_shift_does_not_recreate_watermark_silhouette(tmp_path, offset):
         image.save(path)
         plan = ai.plan_image(image, mask, preview=render_document(path), stamp=source_stamp(path))
     returned_pixels = np.clip(clean.astype(int) + offset, 0, 255).astype(np.uint8)
-    returned = Image.new("RGB", ai.CANVAS, "red")
+    returned = Image.new("RGB", plan.canvas.size, "red")
     left, top, right, bottom = plan.content
     with Image.fromarray(returned_pixels) as clean_image:
         with clean_image.resize((right - left, bottom - top), Image.Resampling.LANCZOS) as content:
@@ -202,19 +204,20 @@ def test_explicit_policy_refusal():
 
 @pytest.mark.parametrize(
     "format,size",
-    [("PNG", (100, 100)), ("JPEG", (1024, 1536)), ("GIF", ai.CANVAS), ("BMP", ai.CANVAS)],
+    [("PNG", (100, 100)), ("JPEG", (1024, 1536)), ("GIF", (1536, 1024)), ("BMP", (1536, 1024))],
 )
 def test_wrong_format_and_size(format, size):
     with Image.new("RGB", size, "white") as image, BytesIO() as stream:
         image.save(stream, format=format)
         with pytest.raises(DocumentError):
-            ai.decode_response(response(raw=stream.getvalue()))
+            ai.decode_response(response(raw=stream.getvalue()), expected=(1536, 1024))
 
 
 def test_animation_limits_and_external_url(plan, monkeypatch):
     with BytesIO() as stream:
         plan.canvas.save(
-            stream, format="PNG", save_all=True, append_images=[Image.new("RGB", ai.CANVAS, "blue")]
+            stream, format="PNG", save_all=True,
+            append_images=[Image.new("RGB", plan.canvas.size, "blue")]
         )
         with pytest.raises(DocumentError):
             ai.decode_response(response(raw=stream.getvalue()))
@@ -236,14 +239,14 @@ def test_valid_png_jpeg_and_mask_outside_changed(plan):
         with BytesIO() as stream:
             plan.canvas.save(stream, format=fmt)
             image = ai.decode_response(response(raw=stream.getvalue()))
-            assert image.size == ai.CANVAS
+            assert image.size == plan.canvas.size
             image.close()
     validated = ai.validate_response(plan, response(plan.canvas))
     assert validated.alignment in {"aligned", "uncertain"}
     validated.image.close()
 
 
-def test_geometry_shift_rejected_and_flat_content_requires_review(tmp_path):
+def test_geometry_shift_rejected_and_flat_content_cannot_be_confirmed(tmp_path):
     rng = np.random.default_rng(123)
     pixels = rng.integers(0, 256, (1024, 1536, 3), np.uint8)
     mask = np.zeros((1024, 1536), np.uint8)
@@ -252,20 +255,23 @@ def test_geometry_shift_rejected_and_flat_content_requires_review(tmp_path):
     with Image.fromarray(pixels) as image:
         plan = ai.plan_image(image, mask)
     assert ai.alignment_status(plan, plan.canvas) == "aligned"
-    shifted = cv2.warpAffine(np.array(plan.canvas), np.float32([[1, 0, 22], [0, 1, 15]]), ai.CANVAS)
+    shifted = cv2.warpAffine(
+        np.array(plan.canvas), np.float32([[1, 0, 22], [0, 1, 15]]), plan.canvas.size
+    )
     with Image.fromarray(shifted) as image:
         assert ai.alignment_status(plan, image) == "rejected"
         checked = ai.validate_response(plan, response(image))
         assert checked.alignment == "rejected"
         assert checked.returned_image.tobytes() == image.tobytes()
         for confirmed in (False, True):
-            with pytest.raises(DocumentError, match="核对对齐"):
+            with pytest.raises(DocumentError) as error:
                 ai.compose_result(plan, checked, AiConfig(), confirmed)
+            assert error.value.code == "alignment"
         checked.close()
-    with Image.new("RGB", ai.CANVAS, "white") as image:
+    with Image.new("RGB", plan.canvas.size, "white") as image:
         assert ai.alignment_status(plan, image) == "uncertain"
     plan.close()
-    with Image.new("RGB", ai.CANVAS, "white") as image:
+    with Image.new("RGB", (1536, 1024), "white") as image:
         flat_plan = ai.plan_image(image, mask)
         assert ai.alignment_status(flat_plan, flat_plan.canvas) == "uncertain"
         flat_plan.close()
@@ -277,7 +283,7 @@ def test_small_shift_corrected_only_after_review_with_rgba_protection(textured_p
     edited = np.array(plan.canvas)
     edited[np.array(plan.remote_mask)[:, :, 3] == 0] = (7, 111, 229)
     matrix = np.float32([[1, 0, shift[0]], [0, 1, shift[1]]])
-    with Image.fromarray(cv2.warpAffine(edited, matrix, ai.CANVAS)) as returned:
+    with Image.fromarray(cv2.warpAffine(edited, matrix, plan.canvas.size)) as returned:
         assert ai.alignment_status(plan, returned) == "correctable"
         checked = ai.validate_response(plan, response(returned))
         assert checked.alignment == "corrected"
@@ -285,8 +291,9 @@ def test_small_shift_corrected_only_after_review_with_rgba_protection(textured_p
         assert checked.raw_image is not None
         assert checked.returned_image.tobytes() == returned.tobytes()
         assert ai.alignment_status(plan, checked.image) == "aligned"
-        with pytest.raises(DocumentError, match="核对对齐"):
+        with pytest.raises(DocumentError) as error:
             ai.compose_result(plan, checked, AiConfig())
+        assert error.value.code == "alignment"
         result = ai.compose_result(plan, checked, AiConfig(), confirmed=True)
     output = np.array(result.image)
     assert np.array_equal(output[plan.mask == 0], plan.pixels[plan.mask == 0])
@@ -310,13 +317,14 @@ def test_small_shift_corrected_only_after_review_with_rgba_protection(textured_p
     ids=["large-translation", "scale", "rotation"],
 )
 def test_excessive_geometry_kept_for_review_not_composition(textured_plan, matrix):
-    shifted = cv2.warpAffine(np.array(textured_plan.canvas), matrix, ai.CANVAS)
+    shifted = cv2.warpAffine(np.array(textured_plan.canvas), matrix, textured_plan.canvas.size)
     with Image.fromarray(shifted) as image:
         checked = ai.validate_response(textured_plan, response(image))
         assert checked.alignment == "rejected"
         assert checked.returned_image.tobytes() == image.tobytes()
-        with pytest.raises(DocumentError, match="核对对齐"):
+        with pytest.raises(DocumentError) as error:
             ai.compose_result(textured_plan, checked, AiConfig(), confirmed=True)
+        assert error.value.code == "alignment"
         checked.close()
 
 
@@ -324,7 +332,7 @@ def test_correction_never_fills_missing_mask_edge(textured_plan):
     plan = textured_plan
     plan.mask[500:520, -2:] = 255
     matrix = np.float32([[1, 0, 6], [0, 1, 0]])
-    with Image.fromarray(cv2.warpAffine(np.array(plan.canvas), matrix, ai.CANVAS)) as image:
+    with Image.fromarray(cv2.warpAffine(np.array(plan.canvas), matrix, plan.canvas.size)) as image:
         assert ai.alignment_status(plan, image) == "correctable"
         checked = ai.validate_response(plan, response(image))
         assert checked.alignment == "rejected"
@@ -336,13 +344,14 @@ def test_correction_never_fills_missing_mask_edge(textured_plan):
 def test_failed_correction_recheck_preserves_raw_and_blocks_override(textured_plan, monkeypatch):
     matrix = np.float32([[1, 0, 5], [0, 1, 0]])
     monkeypatch.setattr(ai, "alignment_status", lambda *args: "uncertain")
-    shifted = cv2.warpAffine(np.array(textured_plan.canvas), matrix, ai.CANVAS)
+    shifted = cv2.warpAffine(np.array(textured_plan.canvas), matrix, textured_plan.canvas.size)
     with Image.fromarray(shifted) as image:
         checked = ai.validate_response(textured_plan, response(image))
         assert checked.alignment == "rejected"
         assert checked.returned_image.tobytes() == image.tobytes()
-        with pytest.raises(DocumentError, match="核对对齐"):
+        with pytest.raises(DocumentError) as error:
             ai.compose_result(textured_plan, checked, AiConfig(), confirmed=True)
+        assert error.value.code == "alignment"
         checked.close()
 
 
@@ -354,8 +363,10 @@ def test_local_geometry_error_keeps_safe_response_for_manual_review(plan, monkey
     checked = ai.validate_response(plan, response(plan.canvas))
     assert checked.alignment == "uncertain"
     assert checked.image.tobytes() == plan.canvas.tobytes()
-    with pytest.raises(DocumentError, match="核对对齐"):
-        ai.compose_result(plan, checked, AiConfig())
+    for confirmed in (False, True):
+        with pytest.raises(DocumentError) as error:
+            ai.compose_result(plan, checked, AiConfig(), confirmed=confirmed)
+        assert error.value.code == "alignment"
     checked.close()
 
 
@@ -368,7 +379,7 @@ def test_padding_never_counts_as_available_repair_content():
     with Image.fromarray(pixels) as image:
         plan = ai.plan_image(image, mask)
     x1, y1, x2, y2 = plan.content
-    assert y1 > 0 and y2 < ai.CANVAS[1]
+    assert y1 > 0 and y2 < plan.canvas.height
     matrix = np.float32([[1, 0, 0], [0, 1, 6]])
     returned = np.array(plan.canvas)
     returned[y1:y2, x1:x2] = cv2.warpAffine(
@@ -385,9 +396,12 @@ def test_padding_never_counts_as_available_repair_content():
 
 def test_uncertain_not_exportable_and_ai_lower_layer_guards(plan, tmp_path):
     checked = ai.AiValidated(plan.canvas.copy(), "uncertain")
-    with pytest.raises(DocumentError, match="核对对齐"):
-        ai.compose_result(plan, checked, AiConfig())
-    result = ai.compose_result(plan, checked, AiConfig(), True)
+    for confirmed in (False, True):
+        with pytest.raises(DocumentError) as error:
+            ai.compose_result(plan, checked, AiConfig(), confirmed=confirmed)
+        assert error.value.code == "alignment"
+    checked.alignment = "aligned"
+    result = ai.compose_result(plan, checked, AiConfig())
     with pytest.raises(DocumentError, match="批量"):
         batch_export(result, [], tmp_path, "all", lambda: False, lambda *a: None)
     with pytest.raises(DocumentError, match="PDF"):
@@ -425,3 +439,52 @@ def test_source_change_cancel_no_watermark_and_area_limits(plan, tmp_path):
 def test_cloud_pdf_never_loads_image(sample_pdf):
     with pytest.raises(DocumentError, match="PDF"):
         ai.prepare_plan(render_document(sample_pdf), source_stamp(sample_pdf), [], True)
+
+
+@pytest.mark.parametrize("size", [(3080, 1600), (1600, 3080), (800, 800), (3000, 1000)])
+def test_native_detail_and_aspect_preserved_with_bounded_output(size):
+    width, height = size
+    yy, xx = np.mgrid[:height, :width]
+    pixels = np.stack((xx % 256, yy % 256, (xx + yy) % 256), axis=2).astype(np.uint8)
+    mask = np.zeros((height, width), np.uint8)
+    mask[10:20, 10:20] = 255
+    mask[-20:-10, -20:-10] = 255
+    with Image.fromarray(pixels) as image:
+        plan = ai.plan_image(image, mask)
+    try:
+        with Image.open(BytesIO(ai.encode_plan(plan))) as uploaded:
+            assert uploaded.size == size
+            assert np.array_equal(np.array(uploaded), pixels)
+        output_width, output_height = plan.canvas.size
+        assert output_width % 16 == output_height % 16 == 0
+        assert ai.MIN_OUTPUT_PIXELS <= output_width * output_height <= ai.MAX_OUTPUT_PIXELS
+        assert abs(output_width / output_height / (width / height) - 1) < 0.02
+        x1, y1, x2, y2 = plan.content
+        assert (x2 - x1) * (y2 - y1) / (output_width * output_height) > 0.98
+    finally:
+        plan.close()
+
+
+@pytest.mark.parametrize("size", [(1800, 300), (300, 1800)])
+def test_unsupported_aspect_can_be_edited_but_not_uploaded(size):
+    width, height = size
+    mask = np.zeros((height, width), np.uint8)
+    mask[10:20, 10:20] = mask[-20:-10, -20:-10] = 255
+    with Image.new("RGB", size, "white") as image:
+        plan = ai.plan_image(image, mask, allow_empty=True)
+    try:
+        assert plan.upload.size == size
+        with pytest.raises(DocumentError) as error:
+            ai.encode_plan(plan)
+        assert error.value.code == "limit"
+    finally:
+        plan.close()
+
+
+def test_oversized_native_upload_is_rejected_without_resizing(plan, monkeypatch):
+    before = plan.upload.tobytes()
+    monkeypatch.setattr(ai, "MAX_IMAGE_BYTES", 10)
+    with pytest.raises(DocumentError) as error:
+        ai.encode_plan(plan)
+    assert error.value.code == "limit"
+    assert plan.upload.tobytes() == before

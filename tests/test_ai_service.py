@@ -106,7 +106,7 @@ def factory(qtbot):
 
 def run(qtbot, service, request=None):
     with qtbot.waitSignal(service.completed, timeout=3000) as signal:
-        service.submit(request or AiRequest(AiConfig(), SECRET, b"fake-png"))
+        service.submit(request or AiRequest(AiConfig(), SECRET, b"fake-png", (1728, 896)))
     return signal.args
 
 
@@ -194,9 +194,9 @@ def test_cancel_late_response_singleflight_and_close(qtbot, factory):
     service, calls = factory({"delay": 150})
     results = []
     service.completed.connect(lambda *args: results.append(args))
-    token = service.submit(AiRequest(AiConfig(), SECRET, b"png"))
+    token = service.submit(AiRequest(AiConfig(), SECRET, b"png", (1728, 896)))
     with pytest.raises(DocumentError):
-        service.submit(AiRequest(AiConfig(), SECRET, b"png"))
+        service.submit(AiRequest(AiConfig(), SECRET, b"png", (1728, 896)))
     with qtbot.waitSignal(service.completed, timeout=1000) as signal:
         service.cancel()
     assert signal.args[2].code == "cancelled"
@@ -207,7 +207,7 @@ def test_cancel_late_response_singleflight_and_close(qtbot, factory):
     assert len(calls) == 1
     service.close()
     with pytest.raises(DocumentError):
-        service.submit(AiRequest(AiConfig(), SECRET, b"png"))
+        service.submit(AiRequest(AiConfig(), SECRET, b"png", (1728, 896)))
 
 
 def test_real_multipart_serialization_loopback_only(qtbot):
@@ -240,7 +240,7 @@ def test_real_multipart_serialization_loopback_only(qtbot):
     service = AiRepairService(manager_factory=Loopback)
     try:
         _, data, error = run(
-            qtbot, service, AiRequest(AiConfig(), SECRET, b"IMAGE")
+            qtbot, service, AiRequest(AiConfig(), SECRET, b"IMAGE", (896, 1728))
         )
         assert error is None and data == b'{"data":[]}'
         assert len(captured) == 1
@@ -251,7 +251,7 @@ def test_real_multipart_serialization_loopback_only(qtbot):
             assert body.count(f'name="{name}"'.encode()) == 1
         assert b'name="mask"' not in body
         assert b'filename="input.png"' in body
-        assert b"1536x1024" in body and b"b64_json" in body and b"gpt-image-2" in body
+        assert b"896x1728" in body and b"b64_json" in body and b"gpt-image-2" in body
         assert b'name="n"' not in body and b"input_fidelity" not in body
     finally:
         service.close()

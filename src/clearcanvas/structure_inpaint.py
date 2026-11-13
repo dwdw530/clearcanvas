@@ -79,8 +79,13 @@ def restore_photo_structure(rgb, excluded, cancelled=lambda: False):
     if np.all(missing) or excluded.size > MAX_STRUCTURE_PIXELS:
         raise DocumentError("轮廓修复区域过大或缺少干净背景，请缩小选区。", "repair_limit")
     executable = executable_path()
+    runtime_help = (
+        "请重新安装完整版本。" if getattr(sys, "frozen", False)
+        else "源码运行请先在项目目录执行 "
+        ".\\.venv\\Scripts\\python.exe tools/prepare_gmic.py，再重试。"
+    )
     if not executable.is_file():
-        raise DocumentError("轮廓修复组件缺失，请重新安装完整版本。", "repair_unavailable")
+        raise DocumentError("轮廓修复组件缺失。" + runtime_help, "repair_unavailable")
     try:
         with tempfile.TemporaryDirectory(prefix="clearcanvas-structure-") as temporary:
             directory = Path(temporary)
@@ -97,7 +102,7 @@ def restore_photo_structure(rgb, excluded, cancelled=lambda: False):
                 repaired = np.array(image)
     except OSError as error:
         raise DocumentError(
-            "无法运行轮廓修复组件，请重新安装完整版本。", "repair_unavailable"
+            "无法运行轮廓修复组件。" + runtime_help, "repair_unavailable"
         ) from error
     repaired[~missing] = rgb[~missing]
     _check_cancelled(cancelled)

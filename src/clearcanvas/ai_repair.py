@@ -18,7 +18,8 @@ from clearcanvas.detection import detect_watermark
 from clearcanvas.documents import MAX_IMAGE_PIXELS, DocumentError, Preview, validate_path
 from clearcanvas.repair import _make_result, source_stamp
 
-CANVAS = (1536, 1024)
+MIN_OUTPUT_PIXELS = 655_360
+MAX_OUTPUT_PIXELS = 1536 * 1024
 MAX_IMAGE_BYTES = 32 * 1024 * 1024
 MAX_CORRECTION_PIXELS = 12
 
@@ -44,6 +45,7 @@ class AiPlan:
     crop: tuple[int, int, int, int]
     content: tuple[int, int, int, int]
     canvas: Image.Image = field(repr=False)
+    upload: Image.Image = field(repr=False)
     remote_mask: Image.Image = field(repr=False)
     automatic: bool = False
     regions: list = field(default_factory=list)
@@ -54,11 +56,35 @@ class AiPlan:
         left, top, right, bottom = self.content
         return right - left < x2 - x1 or bottom - top < y2 - y1
 
+    @property
+    def aspect_supported(self):
+        width, height = self.upload.size
+        return width <= 3 * height and height <= 3 * width
+
     def close(self):
         self.canvas.close()
+        self.upload.close()
         self.remote_mask.close()
         self.pixels = np.empty((0, 0, 4), dtype=np.uint8)
         self.mask = np.empty((0, 0), dtype=np.uint8)
+
+
+def _output_size(width, height):
+    # Match the crop's aspect on the API's 16-pixel grid, without raising the old pixel budget.
+    # Out-of-range crops can still enter the local range editor, but cannot be uploaded.
+    aspect = min(3, max(1 / 3, width / height))
+    pixels = min(MAX_OUTPUT_PIXELS, max(MIN_OUTPUT_PIXELS, width * height))
+    target_height = math.sqrt(pixels / aspect)
+    target_width = target_height * aspect
+    widths = {math.floor(target_width / 16) * 16, math.ceil(target_width / 16) * 16}
+    heights = {math.floor(target_height / 16) * 16, math.ceil(target_height / 16) * 16}
+    sizes = [
+        (w, h) for w in widths for h in heights
+        if MIN_OUTPUT_PIXELS <= w * h <= MAX_OUTPUT_PIXELS and 1 / 3 <= w / h <= 3
+    ]
+    return min(sizes, key=lambda size: (
+        abs(math.log(size[0] / size[1] / aspect)), abs(size[0] * size[1] - pixels)
+    ))
 
 
 def plan_image(
@@ -84,21 +110,26 @@ def plan_image(
     else:
         crop = (0, 0, width, height)
     x1, y1, x2, y2 = crop
-    scale = min(CANVAS[0] / (x2 - x1), CANVAS[1] / (y2 - y1))
+    output_size = _output_size(x2 - x1, y2 - y1)
+    scale = min(output_size[0] / (x2 - x1), output_size[1] / (y2 - y1))
     size = (
-        max(1, min(CANVAS[0], round((x2 - x1) * scale))),
-        max(1, min(CANVAS[1], round((y2 - y1) * scale))),
+        max(1, min(output_size[0], round((x2 - x1) * scale))),
+        max(1, min(output_size[1], round((y2 - y1) * scale))),
     )
-    left, top = (CANVAS[0] - size[0]) // 2, (CANVAS[1] - size[1]) // 2
+    left, top = (output_size[0] - size[0]) // 2, (output_size[1] - size[1]) // 2
     content = (left, top, left + size[0], top + size[1])
     with image.convert("RGBA") as rgba:
         pixels = np.array(rgba)
-    canvas = Image.new("RGB", CANVAS, (240, 240, 240))
+    upload = Image.new("RGB", (x2 - x1, y2 - y1), (240, 240, 240))
     with Image.fromarray(pixels[y1:y2, x1:x2]) as local:
-        with local.resize(size, Image.Resampling.LANCZOS) as resized:
-            canvas.paste(resized, (left, top), resized.getchannel("A"))
-    # API alpha semantics: transparent repair pixels, opaque protected/padded pixels.
-    remote = Image.new("RGBA", CANVAS, (255, 255, 255, 255))
+        with local.getchannel("A") as alpha:
+            upload.paste(local, (0, 0), alpha)
+    # Only this local alignment reference is resized; the upload keeps its native pixels.
+    canvas = Image.new("RGB", output_size, (240, 240, 240))
+    with upload.resize(size, Image.Resampling.LANCZOS) as resized:
+        canvas.paste(resized, (left, top))
+    # This local protection map is not sent as an unverified remote mask parameter.
+    remote = Image.new("RGBA", output_size, (255, 255, 255, 255))
     with Image.fromarray(mask[y1:y2, x1:x2]) as local_mask:
         with local_mask.resize(size, Image.Resampling.NEAREST) as scaled:
             alpha = np.array(remote.getchannel("A"))
@@ -106,7 +137,8 @@ def plan_image(
             with Image.fromarray(alpha) as channel:
                 remote.putalpha(channel)
     return AiPlan(
-        preview, stamp, pixels, mask, crop, content, canvas, remote, automatic, list(regions)
+        preview, stamp, pixels, mask, crop, content, canvas, upload, remote,
+        automatic, list(regions)
     )
 
 
@@ -165,7 +197,7 @@ def prepare_plan(preview, stamp, regions, automatic, cancelled=lambda: False):
 
 def test_plan(cancelled=lambda: False):
     check_cancel(cancelled)
-    with Image.new("RGBA", CANVAS, "#ecefe9") as image:
+    with Image.new("RGBA", (1536, 1024), "#ecefe9") as image:
         draw = ImageDraw.Draw(image)
         for y in range(80, 1000, 100):
             draw.rectangle((100, y, 1400, y + 40), fill=(y % 255, 130, 100, 255))
@@ -178,14 +210,20 @@ def test_plan(cancelled=lambda: False):
 def encode_plan(plan, cancelled=lambda: False):
     check_cancel(cancelled)
     check_repair_mask(plan, plan.mask)
+    if not plan.aspect_supported:
+        raise DocumentError(
+            "上传区域比例超出 1:3 至 3:1；请缩小修复范围或使用本地处理，未上传。", "limit"
+        )
     if plan.original and source_stamp(plan.original.info.path) != plan.stamp:
         raise DocumentError("原文件已变化，未提交请求。", "source")
-    image = png_bytes(plan.canvas)
+    image = png_bytes(plan.upload)
+    if len(image) > MAX_IMAGE_BYTES:
+        raise DocumentError("上传裁剪超过 32 MiB；请缩小范围或使用较小图片，未上传。", "limit")
     check_cancel(cancelled)
     return image
 
 
-def decode_response(raw, expected=CANVAS):
+def decode_response(raw, expected=None):
     if len(raw) > MAX_RESPONSE_BYTES:
         raise DocumentError("接口响应超过安全预算。", "limit")
     try:
@@ -319,7 +357,7 @@ def alignment_status(plan, returned):
 def _correction_covers_mask(plan, matrix, mask=None):
     x1, y1, x2, y2 = plan.content
     cx1, cy1, cx2, cy2 = plan.crop
-    needed = np.zeros((CANVAS[1], CANVAS[0]), np.uint8)
+    needed = np.zeros((plan.canvas.height, plan.canvas.width), np.uint8)
     # Area sampling includes small original mask strokes lost by nearest-neighbor upload masks.
     needed[y1:y2, x1:x2] = cv2.resize(
         (plan.mask if mask is None else mask)[cy1:cy2, cx1:cx2],
@@ -333,7 +371,7 @@ def _correction_covers_mask(plan, matrix, mask=None):
     coverage = cv2.warpAffine(
         available,
         matrix,
-        CANVAS,
+        plan.canvas.size,
         flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
         borderMode=cv2.BORDER_CONSTANT,
         borderValue=0,
@@ -376,7 +414,7 @@ def validate_response(plan, raw, cancelled=lambda: False):
                         cv2.warpAffine(
                             np.array(image),
                             matrix,
-                            CANVAS,
+                            plan.canvas.size,
                             flags=cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP,
                             borderMode=cv2.BORDER_CONSTANT,
                         )
@@ -455,9 +493,11 @@ def _match_boundary_colors(original, returned, mask, cancelled):
 def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: False, mask=None):
     check_cancel(cancelled)
     if validated.alignment != "aligned" and not (
-        validated.alignment in {"uncertain", "corrected"} and confirmed
+        validated.alignment == "corrected" and confirmed
     ):
-        raise DocumentError("需核对对齐，确认前不能合成或导出。", "alignment")
+        raise DocumentError(
+            "返回图未通过可靠对齐检查，或校正结果尚未确认；不能合成。", "alignment"
+        )
     if plan.original is None:
         raise DocumentError("接口测试图不能作为文档结果导出。")
     if source_stamp(plan.original.info.path) != plan.stamp:
@@ -489,7 +529,8 @@ def compose_result(plan, validated, config, confirmed=False, cancelled=lambda: F
         ai_metadata={
             "model": config.model,
             "domain": config.domain,
-            "canvas": CANVAS,
+            "canvas": plan.canvas.size,
+            "upload_size": plan.upload.size,
             "source_size": (pixels.shape[1], pixels.shape[0]),
             "downsampled": plan.downsampled,
             "alignment": validated.alignment,

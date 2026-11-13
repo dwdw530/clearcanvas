@@ -97,7 +97,6 @@ def test_reject_ambiguous_or_insecure_roots(address):
         {"model": ""},
         {"model": "x\nsecret"},
         {"model": "<b>x"},
-        {"size": "auto"},
         {"quality": "medium"},
         {"timeout": 59},
         {"timeout": 601},
@@ -186,12 +185,14 @@ def test_corrupt_settings_fail_safe(store):
     assert next_store.warning
 
 
-def test_obsolete_mask_setting_never_enables_unverified_request_parameter(store):
+def test_obsolete_request_settings_do_not_override_new_protocol(store):
     store.settings.setValue("send_mask", True)
+    store.settings.setValue("size", "1536x1024")
     reloaded = AiSettings(store.settings, store.credentials)
     assert reloaded.config == AiConfig()
     reloaded.save(reloaded.config, SECRET)
     assert not reloaded.settings.contains("send_mask")
+    assert not reloaded.settings.contains("size")
 
 def test_saved_credentials_root_scoped_reload_and_session_fallback(store):
     config = AiConfig()

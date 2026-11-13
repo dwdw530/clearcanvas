@@ -51,10 +51,10 @@ def _local(operation, *args):
         raise DocumentError("AI 本地准备或校验失败；原件和上次结果已保留。", "ai_local") from None
 
 
-def _test_response(raw, cancelled):
+def _test_response(raw, expected, cancelled):
     if cancelled():
         raise DocumentError("已取消。", "cancelled")
-    with decode_response(raw):
+    with decode_response(raw, expected=expected):
         return True
 
 
@@ -168,13 +168,19 @@ class AiController(QObject):
         self.editor.batch_button.setEnabled(result is not None and not busy and not is_ai)
         self.editor.batch_button.setToolTip("首版云端 AI 暂不支持批量。" if is_ai else "批量导出")
         has_received = self.received is not None
+        can_compose = has_received and self.received.validated.alignment in {"aligned", "corrected"}
+        self.review_button.setText(
+            "查看 / 调整已收图片（不联网）" if can_compose else "查看已收图片（仅可另存）"
+        )
         self.review_button.setVisible(has_received)
         self.save_button.setVisible(has_received)
         self.review_button.setEnabled(has_received and not busy)
         self.save_button.setEnabled(has_received and not busy)
         self.received_info.setText(
             "已收图片：" + self.received.plan.original.info.path.name
-            + "\n当前窗口内保留；查看、调整和保存都不联网。"
+            + ("\n可离线调整；仍需检查水印、五官和接缝。" if can_compose
+               else "\n未通过可靠对齐检查，不能合成；可查看和另存。")
+            + "\n当前窗口内保留；退出前请另存。"
             if has_received else ""
         )
         self.editor.auto_button.setText(
@@ -279,7 +285,7 @@ class AiController(QObject):
         self.editor.begin("离线调整已收图片，不联网、不计费")
         self.window._update_controls()
         selected = (
-            saved.mask if saved.validated.alignment == "rejected"
+            saved.mask if saved.validated.alignment not in {"aligned", "corrected"}
             else self.edit_range(saved.plan, saved.mask, received=True)
         )
         if selected is None:
@@ -292,7 +298,7 @@ class AiController(QObject):
         confirmed = False
         if self.validated.alignment != "aligned":
             confirmed = self.confirm_alignment()
-            if self.validated.alignment == "rejected" or not confirmed:
+            if self.validated.alignment != "corrected" or not confirmed:
                 self._end(DocumentError("本次未合成；AI 返回图仍可查看或另存。", "cancelled"))
                 return
         if not self._current():
@@ -308,9 +314,9 @@ class AiController(QObject):
         with Image.fromarray(self.plan.pixels) as original:
             return review_dialog(
                 self.window, "检查实际合成效果（不联网）",
-                "整体对齐不代表局部画质合格。请重点检查五官、头发和原水印位置的色块。\n"
-                "右侧才是准备导出的结果；不满意可暂不使用，再从右侧面板调整范围。"
-                "完整返回图仍保留，另存和调整不会再次计费。",
+                "请分别检查：水印是否清除、鼻翼和唇线是否连续、头发与边缘是否出现接缝。\n"
+                "右侧才是将导出的原图局部修复结果；完整 AI 返回图可能修改其他位置，不会整张采用。"
+                "不满意可保留返回图，但不能把自动对齐当作五官真实还原的保证。",
                 [(original, "原图"), (self.validated.returned_image, "完整 AI 返回图"),
                  (result.image, "实际合成预览（修复范围外保持原样）")],
                 save_callback=self.save_returned,
@@ -320,56 +326,67 @@ class AiController(QObject):
         pixels = plan.pixels.copy()
         pixels[plan.mask != 0, :3] = (240, 90, 60)
         with Image.fromarray(pixels) as overlay:
+            width, height = plan.upload.size
+            output_width, output_height = plan.canvas.size
             text = (
                 f"上传至：{self.config.domain}\n模型：{self.config.model}；一次请求，可能计费。\n"
-                "这是上传内容预览，不是去水印结果。最终只修改右侧标出的修复范围。\n"
-                "裁剪仍可能包含脸部及敏感背景；不能保证恢复原始五官。远端保留政策由服务方决定。"
+                f"原图：{plan.pixels.shape[1]}×{plan.pixels.shape[0]}；"
+                f"上传裁剪：{width}×{height}（不缩放、不补边）。\n"
+                f"请求返回：{output_width}×{output_height}；按裁剪比例选择，不超过旧预设像素预算。\n"
+                "橙色只限制本地最终合成，目前不向中转发送区域文件；提示词不能保证模型不改图。\n"
+                "中转须支持此尺寸；失败不会自动换参数或重试。上传可能包含脸部及敏感背景。"
             )
             if plan.downsampled:
-                text += "\n上传区域将降采样，修复区可能损失细节；最终文件仍按原尺寸输出。"
+                text += "\n返回分辨率低于上传区域；原尺寸导出不代表修复细节完整保留。"
+            if not plan.aspect_supported:
+                text += "\n当前裁剪比例超出 1:3 至 3:1，不能上传；请返回缩小范围或使用本地处理。"
             if self.received is not None:
-                text += "\n这是一次新的生成请求，不是离线调整；取得新图后会替换当前保留图。"
+                text += "\n这是新的计费请求，成功收到图后会替换当前保留图；不是离线调整。"
             return review_dialog(
                 self.window,
                 "第 2 步：确认上传和费用",
                 text,
-                [(plan.canvas, "实际上传图片"), (overlay, "橙色：允许修改的范围")],
+                [(plan.upload, "实际上传图片（原始像素裁剪）"),
+                 (overlay, "原图上的修复范围（仅本地保护）")],
+                allow_accept=plan.aspect_supported,
                 accept_text="确认上传并生成（可能计费）", cancel_text="返回，不上传",
             )
 
     def confirm_alignment(self):
         state = self.validated.alignment
-        images = [(self.plan.canvas, "上传图"), (self.validated.returned_image, "完整 AI 返回图")]
+        images = [(self.plan.canvas, "原图对照（按返回尺寸显示）"),
+                  (self.validated.returned_image, "完整 AI 返回图（未经合成）")]
         if state == "corrected":
             title = "已本地校正，需核对对齐"
             text = (
-                f"检测到最多 {self.validated.displacement:.1f} 个上传像素的整体偏移，"
-                "已在本地校正并重新检查对齐，没有再次调用 API。"
-                "请比较上传图与校正图的五官、边缘及修复区；无法确定请选择取消。"
+                f"检测到最多 {self.validated.displacement:.1f} 个返回画布像素的整体偏移，"
+                "已在本地受限校正并重新通过对齐检查，没有再次调用 API。"
+                "请比较原图对照与校正图的五官、边缘及修复区；无法确定请选择取消。"
             )
             images.append((self.validated.image, "本地校正图（待确认）"))
         elif state == "rejected":
             title = "返回图已保留，本次不能合成"
             text = (
-                "返回图存在明显位移、缩放、构图变化，或校正会缺失修复区内容，已禁止合成。"
+                "返回尺寸不符合请求，或存在明显位移、缩放、构图变化、缺失内容，已禁止合成。"
                 "API 已返回图片，本地拒绝不能撤销服务端费用。"
                 "可先另存完整返回图留存，不会再次调用 API；它不是原尺寸蒙版合成结果。"
                 "关闭窗口后仍在当前任务内保留；退出程序才会释放，请及时另存。"
             )
         else:
-            title = "需核对对齐"
+            title = "无法确认对齐，返回图仅可查看和另存"
             text = (
-                "无法可靠自动判断构图对应。请比较上传图与完整返回图的五官、边缘与构图。"
-                "这只确认位置对应；下一步仍需检查实际合成效果。"
+                "保护区证据不足，无法确认返回内容仍在原来的位置；已禁止合成，不能强制确认。"
+                "这能避免把移动或变形后的五官贴回原图，但不能撤销已发生的服务端费用。"
+                "完整返回图仍保留，可查看和另存；不会自动重新生成。"
             )
-        if state != "rejected":
+        if state == "corrected":
             text += "下一步只生成本地预览，不联网；关闭核对后返回图仍保留。"
         return review_dialog(
             self.window,
             title,
             text,
             images,
-            allow_accept=state != "rejected",
+            allow_accept=state == "corrected",
             save_callback=self.save_returned,
             accept_text="生成本地预览（不联网）",
         )
@@ -456,7 +473,7 @@ class AiController(QObject):
                     return True
                 self._submit("encode", encode_plan, value, self.editor.cancelled.is_set)
             elif self.step == "encode":
-                request = AiRequest(self.config, self.key, value)
+                request = AiRequest(self.config, self.key, value, self.plan.canvas.size)
                 self.key = ""
                 self.network_token = self.service.submit(request)
                 self.step = "network"
@@ -519,7 +536,10 @@ class AiController(QObject):
         else:
             self.window.status.setText("校验结果")
             if self.callback:
-                self._submit("test_validate", _test_response, data, self.editor.cancelled.is_set)
+                self._submit(
+                    "test_validate", _test_response, data, self.plan.canvas.size,
+                    self.editor.cancelled.is_set,
+                )
             else:
                 self._submit(
                     "validate", validate_response, self.plan, data, self.editor.cancelled.is_set

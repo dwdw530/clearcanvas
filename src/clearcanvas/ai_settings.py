@@ -54,7 +54,6 @@ def normalize_root(value: str) -> str:
 class AiConfig:
     root: str = "https://code1.newcli.com/v1"
     model: str = "gpt-image-2"
-    size: str = "1536x1024"
     quality: str = "high"
     timeout: int = 300
 
@@ -70,8 +69,8 @@ class AiConfig:
         root = normalize_root(self.root)
         if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}", self.model):
             raise DocumentError("模型名称必填，只能包含英文、数字和 . _ : / -。", "model")
-        if self.size != "1536x1024" or self.quality != "high":
-            raise DocumentError("尚未验证其他请求预设。", "preset")
+        if self.quality != "high":
+            raise DocumentError("尚未验证其他质量预设。", "preset")
         if type(self.timeout) is not int or not 60 <= self.timeout <= 600:
             raise DocumentError("总超时应为 60–600 秒。", "timeout")
         return replace(self, root=root)
@@ -222,6 +221,7 @@ class AiSettings:
             self.credentials.delete(config.root)
         self._keys[config.root] = "" if delete else key
         self.settings.remove("send_mask")
+        self.settings.remove("size")
         for name, value in asdict(config).items():
             self.settings.setValue(name, value)
         self.settings.setValue("remember", bool(remember and not delete))

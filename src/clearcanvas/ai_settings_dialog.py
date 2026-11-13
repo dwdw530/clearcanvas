@@ -186,12 +186,13 @@ class AiSettingsDialog(QDialog):
         self.model = QLineEdit(store.config.model)
         self.model.setMaxLength(128)
         form.addRow("模型名称 *", self.model)
-        form.addRow("请求预设", plain_label("1536×1024 / high / 单图候选"))
+        form.addRow("请求尺寸", plain_label("按修复区域比例 / high / 原预设像素预算"))
         self.advanced = QGroupBox("高级选项")
         advanced = QFormLayout(self.advanced)
         advanced.addRow("接口兼容方式", plain_label("图片编辑；不发送区域文件。"))
         advanced.addRow(plain_label(
-            "当前仅启用已验证的请求格式，无需设置蒙版。修复范围由软件在本地保护。"
+            "原始像素裁剪上传，不先缩成固定横图。按比例尺寸尚未在此中转完成真实验证；"
+            "不发送未确认支持的区域文件。仅本地保护修复范围，不能保证五官真实还原。"
         ))
         self.timeout = QSpinBox()
         self.timeout.setRange(60, 600)
@@ -316,7 +317,7 @@ class AiSettingsDialog(QDialog):
             "测试图片接口（可能计费）",
             f"向 {config.domain} 提交程序生成的测试图，不读取当前文件。\n"
             f"模型：{config.model}；一次请求，可能计费。\n"
-            "单图响应协议及默认数量尚待验证；本次测试不代表去水印画质通过。",
+            "仅验证这次测试图的尺寸与响应，不代表所有比例兼容或去水印画质通过。"
         ):
             return
         self.testing = True

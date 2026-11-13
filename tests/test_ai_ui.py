@@ -2,7 +2,7 @@ from io import BytesIO
 
 import numpy as np
 import pytest
-from PIL import Image
+from PIL import Image, ImageOps
 from PySide6.QtCore import QObject, QSettings, Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -23,6 +23,18 @@ from clearcanvas.documents import DocumentError
 from clearcanvas.repair import repair_document, source_stamp
 
 
+@pytest.fixture
+def sample_image(tmp_path):
+    # A stable textured scene supplies real correspondence evidence for successful AI flows.
+    # Featureless scenes are tested separately and must no longer pass by manual confirmation.
+    pixels = np.random.default_rng(391).integers(32, 224, (640, 960, 3), np.uint8)
+    pixels[416:448, 528:624] = (255, 0, 100)
+    path = tmp_path / "AI 测试图片.png"
+    with Image.fromarray(pixels) as image:
+        image.save(path)
+    return path
+
+
 class FakeService(QObject):
     completed = Signal(int, object, object)
     stage = Signal(int, str)
@@ -30,10 +42,12 @@ class FakeService(QObject):
     def __init__(self):
         super().__init__()
         self.requests = []
+        self.responses = []
         self.active = None
         self.error = None
         self.hang = False
         self.return_changed = False
+        self.size_override = None
         self.closed = False
 
     def submit(self, request):
@@ -50,10 +64,16 @@ class FakeService(QObject):
                 return
             self.active = None
             self.stage.emit(token, "AI 处理中")
-            with Image.open(BytesIO(request.image)) as image:
-                if self.return_changed:
-                    image.paste("blue", (0, 0, image.width, image.height))
-                self.completed.emit(token, response(image), self.error)
+            with Image.open(BytesIO(request.image)) as uploaded:
+                with ImageOps.pad(
+                    uploaded, self.size_override or request.size,
+                    method=Image.Resampling.LANCZOS, color=(240, 240, 240),
+                ) as image:
+                    if self.return_changed:
+                        image.paste("blue", (0, 0, image.width, image.height))
+                    raw = response(image)
+                    self.responses.append(raw)
+                    self.completed.emit(token, raw, self.error)
 
         QTimer.singleShot(5, finish)
         return token
@@ -213,12 +233,14 @@ def test_failure_cancel_stale_reply_preserves_result(qtbot, ai_window, sample_im
     assert window.editor.result is old and len(service.requests) == 1
 
 
-def test_uncertain_alignment_decline_blocks_new_result(qtbot, ai_window, sample_image, monkeypatch):
+def test_confirmation_cannot_override_uncertain_alignment(
+    qtbot, ai_window, sample_image, monkeypatch
+):
     window, ai, service = ai_window
     load_image(qtbot, window, sample_image)
     service.return_changed = True
     decisions = []
-    monkeypatch.setattr(ai, "confirm_alignment", lambda: decisions.append(True) and False)
+    monkeypatch.setattr(ai, "confirm_alignment", lambda: decisions.append(True) or True)
     ai.mode.setCurrentIndex(1)
     window.editor.start()
     qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
@@ -253,11 +275,11 @@ def test_paid_return_review_save_preserves_old_result_no_second_call(
 
     def review(parent, title, text, images, *, allow_accept, save_callback, **kwargs):
         assert ai.validated is checked[0]
-        assert allow_accept == (state != "rejected")
+        assert allow_accept == (state == "corrected")
         assert len(images) == (3 if state == "corrected" else 2)
         assert save_callback()
-        # Even a caller erroneously returning True cannot override an explicit rejection.
-        return state == "rejected"
+        # A caller returning True cannot override rejected or unproven alignment.
+        return state != "corrected"
 
     monkeypatch.setattr(ai_controller, "validate_response", validate)
     monkeypatch.setattr(ai_controller, "review_dialog", review)
@@ -269,9 +291,9 @@ def test_paid_return_review_save_preserves_old_result_no_second_call(
     assert window.editor.result is old
     assert len(service.requests) == 1
     assert sample_image.read_bytes() == original
-    with Image.open(output) as image, Image.open(BytesIO(service.requests[0].image)) as sent:
-        assert image.size == ai_repair.CANVAS
-        assert image.convert("RGB").tobytes() == sent.convert("RGB").tobytes()
+    with Image.open(output) as image, ai_repair.decode_response(service.responses[0]) as returned:
+        assert image.size == service.requests[0].size
+        assert image.convert("RGB").tobytes() == returned.tobytes()
         assert not image.getexif() and not image.info
     assert ai.plan is None and ai.validated is None
     assert ai.received.validated is checked[0]
@@ -357,7 +379,7 @@ def test_return_save_refuses_original_aliases_and_failure_is_atomic(
     try:
         assert not ai.save_returned()
         assert sample_image.read_bytes() == original
-        assert ai.received.validated.image.size == ai_repair.CANVAS
+        assert ai.received.validated.image.size == plan.canvas.size
         if target == "failure":
             assert destination.read_bytes() == b"existing result"
         elif target in {"wrong-format", "cancel"}:
@@ -394,7 +416,7 @@ def test_return_dialog_save_keeps_review_open_and_keyboard_defaults_to_cancel(
         finally:
             dialog.reject()
 
-    with Image.new("RGB", ai_repair.CANVAS, "white") as image:
+    with Image.new("RGB", (1536, 1024), "white") as image:
         QTimer.singleShot(10, interact)
         assert not ai_settings_dialog.review_dialog(
             window,
@@ -408,7 +430,7 @@ def test_return_dialog_save_keeps_review_open_and_keyboard_defaults_to_cancel(
 
 
 def test_review_thumbnail_fits_whole_image_and_original_scale_remains_scrollable(qtbot):
-    with Image.new("RGB", ai_repair.CANVAS, "white") as image:
+    with Image.new("RGB", (1536, 1024), "white") as image:
         panel = ai_settings_dialog.image_label(image, "返回图")
     panel.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
     qtbot.addWidget(panel)
@@ -422,7 +444,7 @@ def test_review_thumbnail_fits_whole_image_and_original_scale_remains_scrollable
     assert view.image.pixmap().width() <= view.viewport().width()
     assert view.image.pixmap().height() <= view.viewport().height()
     zoom.setChecked(True)
-    assert (view.image.pixmap().width(), view.image.pixmap().height()) == ai_repair.CANVAS
+    assert (view.image.pixmap().width(), view.image.pixmap().height()) == (1536, 1024)
     qtbot.waitUntil(lambda: view.horizontalScrollBar().maximum() > 0)
     zoom.setChecked(False)
     qtbot.waitUntil(
@@ -743,3 +765,19 @@ def test_exit_cancel_preserves_unsaved_paid_image(qtbot, ai_window, sample_image
     assert ai.received.validated.returned_image.tobytes() == original
     assert len(service.requests) == 1
     monkeypatch.setattr(ai, "confirm_exit", lambda: True)
+
+
+def test_interface_test_rejects_unrequested_output_size(qtbot, ai_window, monkeypatch):
+    window, ai, service = ai_window
+    service.size_override = (512, 512)
+    before = ai.store.config
+    dialog = AiSettingsDialog(ai.store, ai, window)
+    qtbot.addWidget(dialog)
+    monkeypatch.setattr(ai_settings_dialog, "confirm", lambda *args: True)
+    dialog._test()
+    qtbot.waitUntil(lambda: not dialog.testing, timeout=10000)
+    assert dialog.receipt is None
+    assert ai.store.config == before
+    assert window.editor.result is None
+    assert len(service.requests) == 1
+    dialog.reject()

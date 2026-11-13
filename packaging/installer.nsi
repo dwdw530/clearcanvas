@@ -3,7 +3,7 @@ Unicode True
 !include "process_guard.nsh"
 
 Name "净界 ClearCanvas"
-OutFile "..\dist\ClearCanvas-0.4.2-Setup.exe"
+OutFile "..\dist\ClearCanvas-0.4.3-Setup.exe"
 InstallDir "$LOCALAPPDATA\Programs\ClearCanvas"
 InstallDirRegKey HKCU "Software\ClearCanvas" "InstallDir"
 RequestExecutionLevel user
@@ -46,7 +46,7 @@ Section "净界"
   CreateShortcut "$DESKTOP\净界.lnk" "$INSTDIR\ClearCanvas.exe"
   WriteRegStr HKCU "Software\ClearCanvas" "InstallDir" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayName" "净界 ClearCanvas"
-  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayVersion" "0.4.2"
+  WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayVersion" "0.4.3"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "InstallLocation" "$INSTDIR"
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "UninstallString" '"$INSTDIR\Uninstall.exe"'
   WriteRegStr HKCU "Software\Microsoft\Windows\CurrentVersion\Uninstall\ClearCanvas" "DisplayIcon" "$INSTDIR\ClearCanvas.exe"
