@@ -115,4 +115,6 @@ def window(qtbot, qapp, monkeypatch):
     qtbot.addWidget(widget)
     widget.show()
     yield widget
+    widget.editor.dirty = False
+    monkeypatch.setattr(widget.editor.ai, "confirm_exit", lambda: True)
     widget.request_exit()

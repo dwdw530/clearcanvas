@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, QSize, Qt
+from PySide6.QtCore import QEvent, QSignalBlocker, QSize, Qt
 from PySide6.QtGui import QAction, QCloseEvent, QDragEnterEvent, QDropEvent, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractSpinBox,
@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from clearcanvas import __version__
 from clearcanvas.canvas import DocumentCanvas
+from clearcanvas.change_highlight import ChangeHighlight
 from clearcanvas.documents import DocumentError, Preview, validate_path
 from clearcanvas.editor import RepairController
 from clearcanvas.icons import icon
@@ -122,6 +123,9 @@ class MainWindow(QMainWindow):
         self.actual_action = QAction("原始比例", self)
         self.actual_action.setShortcut("Ctrl+1")
         self.actual_action.triggered.connect(lambda: self.canvas.set_zoom(1))
+        self.fit_regions_action = self._action(
+            "放大到选区", "zoom-in", lambda: self.editor.fit_regions()
+        )
         self.previous_action = self._action(
             "上一页",
             "chevron-left",
@@ -210,7 +214,9 @@ class MainWindow(QMainWindow):
         page_bar.setObjectName("pageBar")
         bar = QHBoxLayout(page_bar)
         bar.setContentsMargins(12, 7, 12, 7)
-        bar.addStretch()
+        self.canvas_hint = ElidedLabel("拖动框选水印；按住空格拖动")
+        self.canvas_hint.setObjectName("muted")
+        bar.addWidget(self.canvas_hint, 1)
         for action in (self.previous_action,):
             button = QToolButton()
             button.setDefaultAction(action)
@@ -298,7 +304,8 @@ class MainWindow(QMainWindow):
         quit_action.triggered.connect(self.close)
         view_menu = self.menuBar().addMenu("视图")
         view_menu.addActions(
-            [self.zoom_in_action, self.zoom_out_action, self.fit_action, self.actual_action]
+            [self.zoom_in_action, self.zoom_out_action, self.fit_action, self.actual_action,
+             self.fit_regions_action]
         )
         view_menu.addSeparator()
         view_menu.addActions([self.previous_action, self.next_action])
@@ -408,6 +415,9 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _loaded(self, token: int, preview: Preview) -> None:
+        if isinstance(preview, ChangeHighlight):
+            self.editor.finish_highlight(token, preview)
+            return
         if self.editor.ai.loaded(token, preview):
             return
         if token != self._token or self._active_key is None:
@@ -434,6 +444,8 @@ class MainWindow(QMainWindow):
         self._update_controls()
 
     def _failed(self, token: int, error: DocumentError) -> None:
+        if self.editor.finish_highlight(token, error=error):
+            return
         if self.editor.ai.failed(token, error):
             return
         if token != self._token or self._active_key is None:
@@ -559,7 +571,18 @@ class MainWindow(QMainWindow):
             return "minimize"
         return "exit" if box.clickedButton() is exit_button else "cancel"
 
+    def event(self, event) -> bool:
+        if (
+            event.type() in (QEvent.Type.WindowDeactivate, QEvent.Type.Hide)
+            and hasattr(self, "editor")
+        ):
+            self.editor.end_temporary_original()
+            self.canvas.cancel_interaction()
+        return super().event(event)
+
     def closeEvent(self, event: QCloseEvent) -> None:
+        self.editor.end_temporary_original()
+        self.canvas.cancel_interaction()
         if self._closed:
             event.accept()
             return
@@ -594,6 +617,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "暂不能退出", str(error))
             return
         self.service.close()
+        self.editor.reset()
         self._passwords.clear()
         self.tray.hide()
         self._closed = True

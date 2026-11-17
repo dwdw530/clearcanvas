@@ -194,6 +194,8 @@ class AiController(QObject):
         self.editor.repair_button.setText("AI 修复选区" if self.cloud else "修复选区")
 
     def open_settings(self):
+        self.editor.end_temporary_original()
+        self.window.canvas.cancel_interaction()
         if self.editor.busy:
             return
         dialog = AiSettingsDialog(self.store, self, self.window)
@@ -393,6 +395,8 @@ class AiController(QObject):
 
     def save_returned(self):
         """Explicit local PNG retention, separate from a validated mask-only result."""
+        self.editor.end_temporary_original()
+        self.window.canvas.cancel_interaction()
         output = None
         try:
             saved = self.received
@@ -424,6 +428,7 @@ class AiController(QObject):
             if not output.commit():
                 raise DocumentError("返回图保存失败；没有用不完整文件替换目标。")
             saved.saved = True
+            self.editor.record_output(destination, "ai_returned")
         except (DocumentError, OSError, ValueError) as error:
             if output is not None:
                 output.cancelWriting()

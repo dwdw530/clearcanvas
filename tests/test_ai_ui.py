@@ -157,11 +157,25 @@ def test_cloud_manual_success_source_labels_export_no_second_call(
     ai.mode.setCurrentIndex(0)
     assert window.editor.result is result
     assert not window.editor.batch_button.isEnabled()
+    window.editor.highlight_switch.click()
+    qtbot.waitUntil(lambda: not window.editor.busy, timeout=10000)
+    with Image.open(sample_image) as original:
+        changed = np.any(np.asarray(original.convert("RGBA")) != np.asarray(result.image), axis=2)
+    assert window.editor.highlight_cache.mask == (changed.astype(np.uint8) * 255).tobytes()
+    assert window.editor.result is result and window.editor.dirty and len(service.requests) == 1
     output = tmp_path / "cloud.png"
     monkeypatch.setattr(QFileDialog, "getSaveFileName", lambda *a: (str(output), "PNG (*.png)"))
     window.editor.export()
     qtbot.waitUntil(lambda: not window.editor.busy)
     assert output.exists()
+    assert window.editor.output_path == output and window.editor.output_kind == "file"
+    returned_output = tmp_path / "完整 返回图 #.png"
+    monkeypatch.setattr(
+        QFileDialog, "getSaveFileName", lambda *a: (str(returned_output), "PNG (*.png)")
+    )
+    assert ai.save_returned()
+    assert window.editor.output_path == returned_output
+    assert window.editor.output_kind == "ai_returned" and window.editor.result is result
     assert len(service.requests) == 1
     assert ai.key == "" and ai.plan is None
 
@@ -298,6 +312,7 @@ def test_paid_return_review_save_preserves_old_result_no_second_call(
     assert ai.plan is None and ai.validated is None
     assert ai.received.validated is checked[0]
     assert ai.received.saved
+    assert window.editor.output_path == output and window.editor.output_kind == "ai_returned"
     with Image.open(output) as saved:
         assert checked[0].returned_image.tobytes() == saved.convert("RGB").tobytes()
 

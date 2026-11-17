@@ -264,11 +264,32 @@ def test_one_click_ui_without_selection(qtbot, window, pale_image, tmp_path, mon
     assert not window.canvas.regions
     assert window.editor.auto_button.isEnabled()
     assert not window.editor.repair_button.isEnabled()
+    scroll = window.details_dock.widget()
+    scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
     window.editor.auto_button.click()
     assert not window.editor.auto_button.isEnabled()
     qtbot.waitUntil(lambda: window.editor.result is not None, timeout=15000)
     assert window.editor.result.automatic
     assert window.badge.text() == "结果"
+    assert scroll.verticalScrollBar().value() == 0
+    for control in (window.editor.hold_original, window.editor.highlight_switch):
+        assert scroll.viewport().rect().contains(
+            control.mapTo(scroll.viewport(), control.rect().center())
+        )
+    from PySide6.QtCore import QPoint, Qt
+
+    result = window.editor.result
+    view = window.canvas
+    assert window.editor.pan.isChecked() and not view.selection_mode
+    view.set_zoom(2)
+    position = view.viewport().rect().center()
+    for offset in (QPoint(), QPoint(2, 2), QPoint(35, 20)):
+        qtbot.mousePress(view.viewport(), Qt.MouseButton.LeftButton, pos=position)
+        qtbot.mouseMove(view.viewport(), position + offset)
+        qtbot.mouseRelease(view.viewport(), Qt.MouseButton.LeftButton, pos=position + offset)
+        assert window.editor.result is result and window.editor.dirty
+        assert window.editor.tabs.currentIndex() == 1 and not view.regions
+        assert window.editor.export_button.isEnabled()
     artifacts = Path(__file__).resolve().parents[1] / "artifacts" / "qa"
     artifacts.mkdir(parents=True, exist_ok=True)
     window.resize(1000, 680)
